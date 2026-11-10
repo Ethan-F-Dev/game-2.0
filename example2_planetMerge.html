@@ -76,13 +76,11 @@
       // Planet Spawner Function
       function spawnPlanet(x, y, tier = 0) {
         const data = PLANET_TIERS[tier];
-        
         // Rigid Body (Dynamic physics object)
         const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
           .setTranslation(x / PPM, y / PPM)
           .setAngvel((Math.random() - 0.5) * 4);
         const body = world.createRigidBody(bodyDesc);
-
         // Circular Ball Collider
         const colliderDesc = RAPIER.ColliderDesc.ball(data.radius / PPM)
           .setRestitution(0.3)
@@ -90,13 +88,18 @@
           .setDensity(data.density)
           .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS); // Enable collision listener
         const collider = world.createCollider(colliderDesc, body);
-
-        // Visual Rendering (Vector Graphic Circle)
         const graphic = new PIXI.Graphics()
           .circle(0, 0, data.radius)
           .fill(data.color);
-        app.stage.addChild(graphic);
 
+        // Add a planetary ring for Jupiter (Tier 5) or Sun (Tier 6)
+        if (tier === 5 || tier === 6) {
+          graphic
+            .ellipse(0, 0, data.radius * 1.5, data.radius * 0.35)
+            .stroke({ width: 4, color: 0xffffff, alpha: 0.6 }); // Hollow ring stroke
+        }
+
+        app.stage.addChild(graphic);
         const planet = { body, collider, graphic, tier, isDead: false };
         planetMap.set(collider.handle, planet);
         entities.push(planet);
@@ -115,7 +118,39 @@
 
         entities = entities.filter(e => e !== planet);
       }
+      const guideLine = new PIXI.Graphics();
+      app.stage.addChild(guideLine);
+      window.addEventListener('pointermove', (e) => {
+        const minX = (window.innerWidth - window.innerWidth * 0.8) / 2 + 50;
+        const maxX = window.innerWidth - (window.innerWidth - window.innerWidth * 0.8) / 2 - 50;
+        
+        // Clamp line position inside tank walls
+        const aimX = Math.max(minX, Math.min(maxX, e.clientX));
+        const startY = 70;
+        const endY = window.innerHeight - 40;
 
+        // Redraw guide line
+        guideLine
+          .clear()
+          .moveTo(aimX, startY)
+          .lineTo(aimX, endY)
+          .stroke({ width: 2, color: 0xffffff, alpha: 0.3 });
+      });
+      let score = 0;
+
+      const scoreText = new PIXI.Text({
+        text: `Score: ${score}`,
+        style: {
+          fontFamily: 'Arial',
+          fontSize: 28,
+          fill: '#ffffff',
+          fontWeight: 'bold',
+        }
+      });
+
+      // Position near top-left corner
+      scoreText.position.set(30, 30);
+      app.stage.addChild(scoreText);
       // Drop Planet on Screen Click
       window.addEventListener('pointerdown', (e) => {
         const minX = (window.innerWidth - window.innerWidth * 0.8) / 2 + 50;
@@ -167,6 +202,9 @@
           // Remove old collided planets
           destroyPlanet(p1);
           destroyPlanet(p2);
+          // Inside your merge logic:
+          score += (currentTier + 1) * 250;
+          scoreText.text = `Score: ${score}`; // Canvas automatically re-renders text
 
           // Merge into next higher-tier planet
           if (currentTier < PLANET_TIERS.length - 1) {
