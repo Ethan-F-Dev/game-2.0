@@ -90,7 +90,7 @@
         const colliderDesc = RAPIER.ColliderDesc.cuboid(
           (width / 2) / PPM, 
           (height / 2) / PPM
-        ).setRestitution(0.6);
+        ).setRestitution(0.3);
         world.createCollider(colliderDesc, body);
 
         // Pixi Visual Box
@@ -103,12 +103,34 @@
         entities.push({ body, graphic });
       }
 
-      // Initial Spawn
-      spawnBox(window.innerWidth / 2, 100);
+      // Task 2: Ball Spawner Function
+      function spawnBall(x, y) {
+        const radius = 15 + Math.random() * 15; // 15px - 30px
+
+        // Dynamic Physics Body
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(x / PPM, y / PPM)
+          .setAngvel((Math.random() - 0.5) * 6);
+        const body = world.createRigidBody(bodyDesc);
+
+        // Ball Collider with high restitution (bouncy = 0.85)
+        const colliderDesc = RAPIER.ColliderDesc.ball(radius / PPM)
+          .setRestitution(0.85);
+        world.createCollider(colliderDesc, body);
+
+        // Pixi Visual Circle (centered at 0, 0)
+        const randomColor = Math.floor(Math.random() * 0xffffff);
+        const graphic = new PIXI.Graphics()
+          .circle(0, 0, radius)
+          .fill(randomColor);
+        app.stage.addChild(graphic);
+
+        entities.push({ body, graphic });
+      }
 
       // Click / Tap listener
       window.addEventListener('pointerdown', (e) => {
-        spawnBox(e.clientX, e.clientY);
+        spawnBall(e.clientX, e.clientY);
       });
 
       // ------------------------------------
