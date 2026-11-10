@@ -42,30 +42,35 @@
       // ------------------------------------
       // GROUND (STATIC RIGID BODY)
       // ------------------------------------
-      const groundWidth = window.innerWidth * 0.8;
-      const groundHeight = 40;
-      const groundX = window.innerWidth / 2;
-      const groundY = window.innerHeight - 50;
+      // Define all static boundary dimensions [x, y, width, height]
+      const boundaries = [
+        // Floor
+        { x: window.innerWidth / 2, y: window.innerHeight - 20, w: window.innerWidth, h: 40 },
+        // Left Wall
+        { x: 20, y: window.innerHeight / 2, w: 40, h: window.innerHeight },
+        // Right Wall
+        { x: window.innerWidth - 20, y: window.innerHeight / 2, w: 40, h: window.innerHeight }
+      ];
 
-      const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(
-        groundX / PPM, 
-        groundY / PPM
-      );
-      const groundBody = world.createRigidBody(groundBodyDesc);
-      
-      const groundColliderDesc = RAPIER.ColliderDesc.cuboid(
-        (groundWidth / 2) / PPM, 
-        (groundHeight / 2) / PPM
-      );
-      world.createCollider(groundColliderDesc, groundBody);
+      // 1. Create SINGLE static body for all environment walls
+      const staticBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
 
-      // Create visual ground
-      const groundGraphic = new PIXI.Graphics()
-        .rect(-groundWidth / 2, -groundHeight / 2, groundWidth, groundHeight)
-        .fill(0x45475a);
-      groundGraphic.position.set(groundX, groundY);
-      app.stage.addChild(groundGraphic);
+      // 2. Create SINGLE Pixi Graphics container for all walls
+      const staticGraphics = new PIXI.Graphics();
 
+      boundaries.forEach(({ x, y, w, h }) => {
+        // Attach collider to the shared static body using setTranslation offset
+        const colliderDesc = RAPIER.ColliderDesc.cuboid((w / 2) / PPM, (h / 2) / PPM)
+          .setTranslation(x / PPM, y / PPM);
+        world.createCollider(colliderDesc, staticBody);
+
+        // Draw rectangle relative to center anchor
+        staticGraphics
+          .rect(x - w / 2, y - h / 2, w, h)
+          .fill(0x45475a);
+      });
+
+      app.stage.addChild(staticGraphics);
       // ------------------------------------
       // DYNAMIC SPARKING BOXES
       // ------------------------------------
