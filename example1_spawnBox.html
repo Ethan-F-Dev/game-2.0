@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PixiJS + Rapier Demo</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #1e1e2e;
+    }
+  </style>
+</head>
+<body>
+
+  <script type="module">
+    // 1. Use the pre-bundled .mjs distribution file instead of /+esm
+    import * as PIXI from 'https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.mjs';
+    import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier2d-compat@0.12.0/+esm';
+
+    const PPM = 100; // 100 pixels = 1 meter
+
+    async function main() {
+      // 2. Initialize Rapier WebAssembly
+      await RAPIER.init();
+      const world = new RAPIER.World({ x: 0.0, y: 9.81 });
+
+      // 3. Initialize PixiJS Application AND WAIT for it to finish
+      const app = new PIXI.Application();
+      await app.init({ 
+        width: window.innerWidth, 
+        height: window.innerHeight, 
+        backgroundColor: 0x1e1e2e 
+      });
+      document.body.appendChild(app.canvas);
+
+      // ------------------------------------
+      // GROUND (STATIC RIGID BODY)
+      // ------------------------------------
+      const groundWidth = window.innerWidth * 0.8;
+      const groundHeight = 40;
+      const groundX = window.innerWidth / 2;
+      const groundY = window.innerHeight - 50;
+
+      const groundBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(
+        groundX / PPM, 
+        groundY / PPM
+      );
+      const groundBody = world.createRigidBody(groundBodyDesc);
+      
+      const groundColliderDesc = RAPIER.ColliderDesc.cuboid(
+        (groundWidth / 2) / PPM, 
+        (groundHeight / 2) / PPM
+      );
+      world.createCollider(groundColliderDesc, groundBody);
+
+      // Create visual ground
+      const groundGraphic = new PIXI.Graphics()
+        .rect(-groundWidth / 2, -groundHeight / 2, groundWidth, groundHeight)
+        .fill(0x45475a);
+      groundGraphic.position.set(groundX, groundY);
+      app.stage.addChild(groundGraphic);
+
+      // ------------------------------------
+      // DYNAMIC SPARKING BOXES
+      // ------------------------------------
+      const entities = [];
+
+      function spawnBox(x, y) {
+        const width = 40 + Math.random() * 20;
+        const height = 40 + Math.random() * 20;
+
+        // Dynamic Physics Body
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(x / PPM, y / PPM)
+          .setAngvel((Math.random() - 0.5) * 6);
+        const body = world.createRigidBody(bodyDesc);
+
+        // Bouncy Collider
+        const colliderDesc = RAPIER.ColliderDesc.cuboid(
+          (width / 2) / PPM, 
+          (height / 2) / PPM
+        ).setRestitution(0.6);
+        world.createCollider(colliderDesc, body);
+
+        // Pixi Visual Box
+        const randomColor = Math.floor(Math.random() * 0xffffff);
+        const graphic = new PIXI.Graphics()
+          .rect(-width / 2, -height / 2, width, height)
+          .fill(randomColor);
+        app.stage.addChild(graphic);
+
+        entities.push({ body, graphic });
+      }
+
+      // Initial Spawn
+      spawnBox(window.innerWidth / 2, 100);
+
+      // Click / Tap listener
+      window.addEventListener('pointerdown', (e) => {
+        spawnBox(e.clientX, e.clientY);
+      });
+
+      // ------------------------------------
+      // MAIN ANIMATION TICKER
+      // ------------------------------------
+      app.ticker.add(() => {
+        world.step();
+
+        for (const { body, graphic } of entities) {
+          const pos = body.translation();
+          const rot = body.rotation();
+
+          graphic.x = pos.x * PPM;
+          graphic.y = pos.y * PPM;
+          graphic.rotation = rot;
+        }
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>
