@@ -29,10 +29,13 @@
 
       // 3. Initialize PixiJS Application AND WAIT for it to finish
       const app = new PIXI.Application();
-      await app.init({ 
-        width: window.innerWidth, 
-        height: window.innerHeight, 
-        backgroundColor: 0x1e1e2e 
+      await app.init({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        backgroundColor: 0x1e1e2e,
+        antialias: true,
+        resolution: Math.min(window.devicePixelRatio || 1, 2), // Cap at 2x max
+        autoDensity: true,
       });
       document.body.appendChild(app.canvas);
 
