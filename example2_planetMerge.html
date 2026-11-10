@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Planet Merge Game</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #0b0e14;
+      font-family: sans-serif;
+    }
+  </style>
+</head>
+<body>
+
+  <script type="module">
+    import * as PIXI from 'https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.mjs';
+    import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier2d-compat@0.12.0/+esm';
+
+    const PPM = 100; // 100 pixels = 1 meter scale ratio
+
+    // PLANET TIERS (Smallest -> Largest)
+    const PLANET_TIERS = [
+      { name: "Pluto",   radius: 14, color: 0x95a5a6, density: 1.0 },
+      { name: "Moon",    radius: 20, color: 0xd5dbdb, density: 1.2 },
+      { name: "Mars",    radius: 28, color: 0xe74c3c, density: 1.5 },
+      { name: "Earth",   radius: 38, color: 0x3498db, density: 2.0 },
+      { name: "Neptune", radius: 50, color: 0x1abc9c, density: 2.5 },
+      { name: "Jupiter", radius: 66, color: 0xe67e22, density: 3.0 },
+      { name: "Sun",     radius: 86, color: 0xf1c40f, density: 4.0 }
+    ];
+
+    async function main() {
+      // 1. Initialize Physics Engine & Event Receiver
+      await RAPIER.init();
+      const world = new RAPIER.World({ x: 0.0, y: 15.0 }); // Space gravity simulation
+      const eventQueue = new RAPIER.EventQueue(true);
+
+      // 2. Initialize PixiJS Render Application
+      const app = new PIXI.Application();
+      await app.init({ 
+        width: window.innerWidth, 
+        height: window.innerHeight, 
+        backgroundColor: 0x0b0e14,
+        antialias: true,
+        resolution: Math.min(window.devicePixelRatio || 1, 2),
+        autoDensity: true
+      });
+      document.body.appendChild(app.canvas);
+
+      // 3. Setup Glass Containment Tank (Static Walls)
+      const boundaries = [
+        { x: window.innerWidth / 2, y: window.innerHeight - 20, w: window.innerWidth * 0.8, h: 40 }, // Floor
+        { x: (window.innerWidth - window.innerWidth * 0.8) / 2, y: window.innerHeight / 2, w: 40, h: window.innerHeight }, // Left Wall
+        { x: window.innerWidth - (window.innerWidth - window.innerWidth * 0.8) / 2, y: window.innerHeight / 2, w: 40, h: window.innerHeight } // Right Wall
+      ];
+
+      const staticBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+      const staticGraphics = new PIXI.Graphics();
+
+      boundaries.forEach(({ x, y, w, h }) => {
+        const colliderDesc = RAPIER.ColliderDesc.cuboid((w / 2) / PPM, (h / 2) / PPM)
+          .setTranslation(x / PPM, y / PPM);
+        world.createCollider(colliderDesc, staticBody);
+        staticGraphics.rect(x - w / 2, y - h / 2, w, h).fill(0x1f293d);
+      });
+      app.stage.addChild(staticGraphics);
+
+      // 4. Planet State Tracking
+      let entities = [];
+      const planetMap = new Map(); // Key: collider.handle -> Value: planet object
+
+      // Planet Spawner Function
+      function spawnPlanet(x, y, tier = 0) {
+        const data = PLANET_TIERS[tier];
+        
+        // Rigid Body (Dynamic physics object)
+        const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+          .setTranslation(x / PPM, y / PPM)
+          .setAngvel((Math.random() - 0.5) * 4);
+        const body = world.createRigidBody(bodyDesc);
+
+        // Circular Ball Collider
+        const colliderDesc = RAPIER.ColliderDesc.ball(data.radius / PPM)
+          .setRestitution(0.3)
+          .setFriction(0.4)
+          .setDensity(data.density)
+          .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS); // Enable collision listener
+        const collider = world.createCollider(colliderDesc, body);
+
+        // Visual Rendering (Vector Graphic Circle)
+        const graphic = new PIXI.Graphics()
+          .circle(0, 0, data.radius)
+          .fill(data.color);
+        app.stage.addChild(graphic);
+
+        const planet = { body, collider, graphic, tier, isDead: false };
+        planetMap.set(collider.handle, planet);
+        entities.push(planet);
+        return planet;
+      }
+
+      // Safe Removal Method
+      function destroyPlanet(planet) {
+        if (planet.isDead) return;
+        planet.isDead = true;
+
+        planetMap.delete(planet.collider.handle);
+        world.removeRigidBody(planet.body);
+        app.stage.removeChild(planet.graphic);
+        planet.graphic.destroy();
+
+        entities = entities.filter(e => e !== planet);
+      }
+
+      // Drop Planet on Screen Click
+      window.addEventListener('pointerdown', (e) => {
+        const minX = (window.innerWidth - window.innerWidth * 0.8) / 2 + 50;
+        const maxX = window.innerWidth - (window.innerWidth - window.innerWidth * 0.8) / 2 - 50;
+        
+        const spawnX = Math.max(minX, Math.min(maxX, e.clientX));
+        const spawnY = 70;
+        
+        // Random starting drop: Pluto (Tier 0) or Moon (Tier 1)
+        const startingTier = Math.floor(Math.random() * 2);
+        spawnPlanet(spawnX, spawnY, startingTier);
+      });
+
+      // 5. Main Simulation and Event Render Loop
+      app.ticker.add(() => {
+        // Step physics world forward and pass event queue recorder
+        world.step(eventQueue);
+
+        const toMerge = [];
+        const processedHandles = new Set();
+
+        // Drain collision events safely
+        eventQueue.drainCollisionEvents((handle1, handle2, started) => {
+          if (!started) return;
+
+          const p1 = planetMap.get(handle1);
+          const p2 = planetMap.get(handle2);
+
+          // Verify both bodies exist, are active, and share identical tiers
+          if (p1 && p2 && !p1.isDead && !p2.isDead && p1.tier === p2.tier) {
+            if (!processedHandles.has(handle1) && !processedHandles.has(handle2)) {
+              processedHandles.add(handle1);
+              processedHandles.add(handle2);
+              toMerge.push({ p1, p2 });
+            }
+          }
+        });
+
+        // Execute deferred planet merging
+        for (const { p1, p2 } of toMerge) {
+          const pos1 = p1.body.translation();
+          const pos2 = p2.body.translation();
+          
+          // Calculate midpoint collision position
+          const midX = ((pos1.x + pos2.x) / 2) * PPM;
+          const midY = ((pos1.y + pos2.y) / 2) * PPM;
+          const currentTier = p1.tier;
+
+          // Remove old collided planets
+          destroyPlanet(p1);
+          destroyPlanet(p2);
+
+          // Merge into next higher-tier planet
+          if (currentTier < PLANET_TIERS.length - 1) {
+            spawnPlanet(midX, midY, currentTier + 1);
+          }
+        }
+
+        // Sync Pixi Graphics transforms to Rapier body locations
+        for (const entity of entities) {
+          if (entity.isDead) continue;
+          const pos = entity.body.translation();
+          const rot = entity.body.rotation();
+
+          entity.graphic.x = pos.x * PPM;
+          entity.graphic.y = pos.y * PPM;
+          entity.graphic.rotation = rot;
+        }
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>
