@@ -1,0 +1,2267 @@
+<!-- NEON VOID — standalone single-file build.
+     All 10 source modules inlined verbatim; identical to the multi-file version.
+     Open in any modern browser. No engine, no libraries, no server. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>NEON VOID — vector arcade shooter</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><polygon points='16,3 29,26 16,20 3,26' fill='%2345f0ff'/></svg>">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #04060f; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #err {
+    position: fixed; left: 8px; bottom: 8px; color: #ff6a6a;
+    font: 11px/1.45 monospace; white-space: pre-wrap; max-width: 90vw;
+    pointer-events: none; text-shadow: 0 0 6px #000; z-index: 9;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="err"></div>
+<script>
+  /* Runtime error overlay — invaluable during development, invisible in normal play. */
+  window.addEventListener('error', function (e) {
+    var d = document.getElementById('err');
+    d.textContent += (e.message || e.error) + '\n  at ' + (e.filename || '') + ':' + (e.lineno || '') + '\n';
+  });
+</script>
+<script>
+/* ==== inlined: js/config.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — config.js
+   All gameplay tuning constants and the color palette.
+   ============================================================ */
+window.NV = window.NV || {};
+
+NV.CONFIG = {
+  WORLD_W: 1600,          // logical arena size (letterboxed to any screen)
+  WORLD_H: 900,
+  GRID_SPACING: 40,       // warping background lattice
+  MAX_PARTICLES: 1400,    // hard cap for the pooled particle system
+};
+
+NV.TUNE = {
+  player: {
+    radius: 11,
+    accel: 2700,          // thrust px/s^2
+    drag: 3.0,            // exponential damping coefficient
+    maxSpeed: 560,
+    fireCd: 0.115,
+    fireCdRapid: 0.072,
+    bulletSpeed: 990,
+    bulletLife: 1.0,
+    dashTime: 0.14,
+    dashSpeed: 2150,
+    dashCd: 1.5,
+    startLives: 3,
+    maxLives: 6,
+    startBombs: 2,
+    maxBombs: 4,
+    respawnInvuln: 2.6,
+    hitInvuln: 1.2,
+  },
+  powerupTime: 12,        // seconds triple/rapid last
+  multiplierMax: 8,
+  magnetDist: 130,        // pickup magnet radius
+};
+
+NV.PALETTE = {
+  bg: '#04060f',
+  grid: 'rgba(56, 92, 178, 0.20)',
+  gridHot: 'rgba(120, 170, 255, 0.55)',
+  border: '#2c4a8f',
+  player: '#45f0ff',
+  playerCore: '#ffffff',
+  bullet: '#9ff8ff',
+  ebullet: '#ff6a3c',
+  text: '#dfe8ff',
+  dim: '#7d8fc9',
+  gold: '#ffd23c',
+  mult: '#5cff8f',
+};
+
+</script>
+<script>
+/* ==== inlined: js/utils.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — utils.js
+   Math helpers, in-place array compaction, swept-segment
+   collision tests and a uniform-grid spatial hash for
+   broad-phase collision culling.
+   ============================================================ */
+(function () {
+  const U = {};
+
+  U.TAU = Math.PI * 2;
+  U.clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+  U.lerp = (a, b, t) => a + (b - a) * t;
+  U.rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+  U.pick = (arr) => arr[(Math.random() * arr.length) | 0];
+  U.dist2 = (x1, y1, x2, y2) => { const dx = x2 - x1, dy = y2 - y1; return dx * dx + dy * dy; };
+  U.easeOut = (t) => 1 - (1 - t) * (1 - t);
+
+  /* Remove every element whose `.dead` flag is set — in place, no allocation. */
+  U.compact = (arr) => {
+    let j = 0;
+    for (let i = 0; i < arr.length; i++) { const o = arr[i]; if (!o.dead) arr[j++] = o; }
+    arr.length = j;
+  };
+
+  /* Regular polygon: n vertices on the unit circle, optionally rotated. */
+  U.poly = (n, rot = 0) => {
+    const p = [];
+    for (let i = 0; i < n; i++) { const a = rot + (i / n) * U.TAU; p.push([Math.cos(a), Math.sin(a)]); }
+    return p;
+  };
+
+  /* Star polygon: `spikes` long points alternating with short ones. */
+  U.star = (spikes, ratio = 0.45, rot = 0) => {
+    const p = [], n = spikes * 2;
+    for (let i = 0; i < n; i++) {
+      const a = rot + (i / n) * U.TAU, r = (i % 2 === 0) ? 1 : ratio;
+      p.push([Math.cos(a) * r, Math.sin(a) * r]);
+    }
+    return p;
+  };
+
+  /* Sweep test: does segment (x1,y1)->(x2,y2) pass within r of (cx,cy)?
+     Used so fast bullets never tunnel through enemies between frames.  */
+  U.segCircle = (x1, y1, x2, y2, cx, cy, r) => {
+    const dx = x2 - x1, dy = y2 - y1;
+    const fx = x1 - cx, fy = y1 - cy;
+    const a = dx * dx + dy * dy;
+    let t = a > 1e-9 ? -(fx * dx + fy * dy) / a : 0;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    const px = fx + dx * t, py = fy + dy * t;
+    return px * px + py * py <= r * r;
+  };
+
+  /* Uniform-grid spatial hash. Rebuilt every frame from enemy positions;
+     queries return candidates that exact circle/segment tests then refine. */
+  U.SpatialHash = class {
+    constructor(cell) { this.cell = cell; this.map = new Map(); }
+    clear() { this.map.clear(); }
+    _key(cx, cy) { return (cx + 512) * 4096 + (cy + 512); }
+    insert(e) {
+      const k = this._key(Math.floor(e.x / this.cell), Math.floor(e.y / this.cell));
+      let a = this.map.get(k);
+      if (!a) { a = []; this.map.set(k, a); }
+      a.push(e);
+    }
+    query(x, y, r, out) {
+      out.length = 0;
+      const c = this.cell;
+      const x0 = Math.floor((x - r) / c), x1 = Math.floor((x + r) / c);
+      const y0 = Math.floor((y - r) / c), y1 = Math.floor((y + r) / c);
+      for (let cx = x0; cx <= x1; cx++) {
+        for (let cy = y0; cy <= y1; cy++) {
+          const a = this.map.get(this._key(cx, cy));
+          if (a) for (let i = 0; i < a.length; i++) out.push(a[i]);
+        }
+      }
+      return out;
+    }
+  };
+
+  window.NV.U = U;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/render.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — render.js
+   Resolution-independent letterboxed canvas + the neon vector
+   drawing toolkit:
+
+   • multi-pass strokes        → glow lines without shadowBlur cost
+   • cached radial glow sprites→ cheap additive bloom for anything
+   • letterbox transform       → fixed 1600x900 arena on any screen
+   • spaced text               → arcade-style letter-spaced display type
+   ============================================================ */
+(function () {
+  const Render = {
+    canvas: null, ctx: null,
+    dpr: 1, scale: 1, offX: 0, offY: 0, cssW: 0, cssH: 0,
+    _glows: new Map(), _scan: null, _vig: null,
+
+    init(canvas) {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext('2d', { alpha: false });
+      this.resize();
+      window.addEventListener('resize', () => this.resize());
+    },
+
+    resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = window.innerWidth, h = window.innerHeight;
+      this.dpr = dpr; this.cssW = w; this.cssH = h;
+      this.canvas.width = Math.round(w * dpr);
+      this.canvas.height = Math.round(h * dpr);
+      const W = NV.CONFIG.WORLD_W, H = NV.CONFIG.WORLD_H;
+      this.scale = Math.min(w / W, h / H);          // fit, keep aspect
+      this.offX = (w - W * this.scale) * 0.5;       // letterbox margins
+      this.offY = (h - H * this.scale) * 0.5;
+      this._vig = null;                             // rebuild lazily
+    },
+
+    screenToWorld(sx, sy) {
+      return { x: (sx - this.offX) / this.scale, y: (sy - this.offY) / this.scale };
+    },
+
+    /* Clear to the background color in screen space. */
+    begin() {
+      const c = this.ctx;
+      c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      c.globalAlpha = 1;
+      c.globalCompositeOperation = 'source-over';
+      c.fillStyle = NV.PALETTE.bg;
+      c.fillRect(0, 0, this.cssW, this.cssH);
+    },
+
+    /* World transform, including camera shake offset. */
+    world(camX = 0, camY = 0) {
+      const c = this.ctx, s = this.dpr * this.scale;
+      c.setTransform(s, 0, 0, s,
+        this.dpr * (this.offX + camX * this.scale),
+        this.dpr * (this.offY + camY * this.scale));
+    },
+
+    /* Screen-space post processing: vignette + subtle scanlines. */
+    post() {
+      const c = this.ctx;
+      c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      c.globalCompositeOperation = 'source-over';
+      c.globalAlpha = 1;
+      if (!this._vig || this._vig.width !== this.cssW || this._vig.height !== this.cssH) {
+        const v = document.createElement('canvas');
+        v.width = Math.max(2, this.cssW); v.height = Math.max(2, this.cssH);
+        const g = v.getContext('2d');
+        const gr = g.createRadialGradient(
+          v.width / 2, v.height / 2, Math.min(v.width, v.height) * 0.36,
+          v.width / 2, v.height / 2, Math.max(v.width, v.height) * 0.72);
+        gr.addColorStop(0, 'rgba(2,4,12,0)');
+        gr.addColorStop(1, 'rgba(2,4,12,0.62)');
+        g.fillStyle = gr; g.fillRect(0, 0, v.width, v.height);
+        this._vig = v;
+      }
+      c.drawImage(this._vig, 0, 0);
+      if (!this._scan) {
+        const s = document.createElement('canvas');
+        s.width = 1; s.height = 3;
+        const g = s.getContext('2d');
+        g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(0, 2, 1, 1);
+        this._scan = c.createPattern(s, 'repeat');
+      }
+      c.globalAlpha = 0.13;
+      c.fillStyle = this._scan;
+      c.fillRect(0, 0, this.cssW, this.cssH);
+      c.globalAlpha = 1;
+    },
+
+    /* Cached radial-gradient sprite, composited additively for cheap bloom. */
+    glowSprite(color) {
+      let s = this._glows.get(color);
+      if (!s) {
+        s = document.createElement('canvas');
+        s.width = s.height = 128;
+        const g = s.getContext('2d');
+        const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+        gr.addColorStop(0, 'rgba(255,255,255,0.85)');
+        gr.addColorStop(0.25, color);
+        gr.addColorStop(1, 'rgba(0,0,0,0)');
+        g.fillStyle = gr;
+        g.fillRect(0, 0, 128, 128);
+        this._glows.set(color, s);
+      }
+      return s;
+    },
+
+    drawGlow(x, y, r, color, alpha = 1) {
+      if (alpha <= 0) return;
+      const c = this.ctx;
+      c.globalAlpha = alpha;
+      c.drawImage(this.glowSprite(color), x - r, y - r, r * 2, r * 2);
+      c.globalAlpha = 1;
+    },
+
+    /* The signature look: three stroke passes (wide faint → mid → bright core).
+       Best used with globalCompositeOperation = 'lighter'. */
+    neon(pts, color, width = 2, alpha = 1, close = true) {
+      if (alpha <= 0 || pts.length < 2) return;
+      const c = this.ctx;
+      c.strokeStyle = color;
+      c.lineJoin = 'round'; c.lineCap = 'round';
+      const passes = [[width * 5, 0.08], [width * 2.1, 0.22], [width, 1]];
+      for (let p = 0; p < 3; p++) {
+        c.globalAlpha = alpha * passes[p][1];
+        c.lineWidth = passes[p][0];
+        c.beginPath();
+        c.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+        if (close) c.closePath();
+        c.stroke();
+      }
+      c.globalAlpha = 1;
+    },
+
+    neonPoly(x, y, r, sides, rot, color, width = 2, alpha = 1) {
+      const TAU = NV.U.TAU, pts = [];
+      for (let i = 0; i < sides; i++) {
+        const a = rot + (i / sides) * TAU;
+        pts.push([x + Math.cos(a) * r, y + Math.sin(a) * r]);
+      }
+      this.neon(pts, color, width, alpha, true);
+    },
+
+    neonCircle(x, y, r, color, width = 2, alpha = 1) {
+      if (alpha <= 0) return;
+      const c = this.ctx;
+      c.strokeStyle = color; c.lineCap = 'round';
+      const passes = [[width * 4, 0.08], [width, 0.85]];
+      for (let p = 0; p < 2; p++) {
+        c.globalAlpha = alpha * passes[p][1];
+        c.lineWidth = passes[p][0];
+        c.beginPath();
+        c.arc(x, y, Math.max(0.1, r), 0, NV.U.TAU);
+        c.stroke();
+      }
+      c.globalAlpha = 1;
+    },
+
+    /* Arcade-style letter-spaced display text. Returns measured width. */
+    spaced(text, x, y, size, spacing, color, align = 'center', weight = 900) {
+      const c = this.ctx;
+      c.font = `${weight} ${size}px system-ui, sans-serif`;
+      c.textBaseline = 'middle';
+      c.fillStyle = color;
+      let w = 0;
+      const widths = [];
+      for (const ch of text) { const cw = c.measureText(ch).width; widths.push(cw); w += cw + spacing; }
+      w -= spacing;
+      let cx = align === 'center' ? x - w / 2 : (align === 'right' ? x - w : x);
+      c.textAlign = 'left';
+      for (let i = 0; i < text.length; i++) { c.fillText(text[i], cx, y); cx += widths[i] + spacing; }
+      return w;
+    },
+  };
+
+  window.NV.Render = Render;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/audio.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — audio.js
+   100% procedural audio. There is not a single sample file in
+   this game: every sound effect is an oscillator/noise recipe,
+   and the soundtrack is generated live by a 16th-note scheduler
+   playing an A-minor-pentatonic pattern whose density, tempo
+   and layers scale with the wave number.
+   ============================================================ */
+(function () {
+  const Audio = {
+    ctx: null, master: null, sfx: null, musicBus: null, delay: null,
+    muted: false, _noise: null,
+    step: 0, nextT: 0, bpm: 108, intensity: 0.1,
+
+    /* Must be called from a user gesture (browser autoplay policy). */
+    init() {
+      if (this.ctx) {
+        if (this.ctx.state === 'suspended') {
+          const r = this.ctx.resume();
+          if (r && r.catch) r.catch(() => {});
+        }
+        return;
+      }
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      try {
+        const ctx = this.ctx = new AC();
+        const comp = ctx.createDynamicsCompressor();
+        comp.threshold.value = -18; comp.ratio.value = 6;
+        comp.connect(ctx.destination);
+        this.master = ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.85;
+        this.master.connect(comp);
+        this.sfx = ctx.createGain(); this.sfx.gain.value = 0.9; this.sfx.connect(this.master);
+        this.musicBus = ctx.createGain(); this.musicBus.gain.value = 0.55; this.musicBus.connect(this.master);
+        // dubby feedback delay shared by all musical voices
+        this.delay = ctx.createDelay(1.0);
+        this.delay.delayTime.value = 0.29;
+        const fb = ctx.createGain(); fb.gain.value = 0.34;
+        this.delay.connect(fb); fb.connect(this.delay);
+        const wet = ctx.createGain(); wet.gain.value = 0.5;
+        this.delay.connect(wet); wet.connect(this.musicBus);
+        // one second of white noise, reused by every noise-based sound
+        const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        this._noise = buf;
+        this.nextT = ctx.currentTime + 0.1;
+        setInterval(() => this._schedule(), 40); // lookahead scheduler
+      } catch (e) { this.ctx = null; }
+    },
+
+    toggleMute() {
+      this.muted = !this.muted;
+      if (this.master) this.master.gain.value = this.muted ? 0 : 0.85;
+      try { localStorage.setItem('nv_mute', this.muted ? '1' : '0'); } catch (e) {}
+    },
+    loadMute() { try { this.muted = localStorage.getItem('nv_mute') === '1'; } catch (e) {} },
+
+    /* ---------- primitive voices ---------------------------------- */
+    /* One oscillator with pitch ramp, optional lowpass, attack and
+       echo send. Every SFX and every musical note routes through here. */
+    voice(o) {
+      if (!this.ctx) return;
+      const ctx = this.ctx, t = o.when !== undefined ? o.when : ctx.currentTime;
+      const osc = ctx.createOscillator();
+      osc.type = o.type || 'sine';
+      osc.frequency.setValueAtTime(Math.max(20, o.f0 || 440), t);
+      if (o.f1 && o.f1 !== o.f0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.f1), t + o.dur);
+      const g = ctx.createGain();
+      const v = o.vol !== undefined ? o.vol : 0.2;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(v, t + (o.attack || 0.004));
+      g.gain.exponentialRampToValueAtTime(0.0001, t + o.dur);
+      let node = osc;
+      if (o.lp) {
+        const f = ctx.createBiquadFilter();
+        f.type = 'lowpass'; f.frequency.value = o.lp;
+        osc.connect(f); node = f;
+      }
+      node.connect(g);
+      g.connect(o.dest || this.sfx);
+      if (o.echo) { const e = ctx.createGain(); e.gain.value = 0.5; g.connect(e); e.connect(this.delay); }
+      osc.start(t); osc.stop(t + o.dur + 0.1);
+    },
+
+    /* Filtered white noise burst (explosions, whooshes, hats). */
+    noise(o) {
+      if (!this.ctx) return;
+      const ctx = this.ctx, t = o.when !== undefined ? o.when : ctx.currentTime;
+      const src = ctx.createBufferSource();
+      src.buffer = this._noise; src.loop = true;
+      const f = ctx.createBiquadFilter();
+      f.type = o.ftype || 'lowpass'; f.Q.value = o.q || 0.8;
+      f.frequency.setValueAtTime(Math.max(30, o.f0 || 4000), t);
+      if (o.f1) f.frequency.exponentialRampToValueAtTime(Math.max(30, o.f1), t + o.dur);
+      const g = ctx.createGain();
+      const v = o.vol !== undefined ? o.vol : 0.3;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(v, t + (o.attack || 0.006));
+      g.gain.exponentialRampToValueAtTime(0.0001, t + o.dur);
+      src.connect(f); f.connect(g); g.connect(o.dest || this.sfx);
+      src.start(t); src.stop(t + o.dur + 0.05);
+    },
+
+    /* ---------- sound effects ------------------------------------- */
+    shoot()      { const d = 60 + Math.random() * 40;
+                   this.voice({ type: 'square',   f0: 720 + d, f1: 190, dur: 0.07,  vol: 0.045 });
+                   this.voice({ type: 'sawtooth', f0: 1500 + d * 2, f1: 340, dur: 0.045, vol: 0.02 }); },
+    enemyHit()   { this.voice({ type: 'triangle', f0: 480 + Math.random() * 120, f1: 240, dur: 0.05, vol: 0.05 }); },
+    enemyDie(s)  { this.voice({ type: 'triangle', f0: 520 + Math.random() * 80, f1: 55, dur: 0.12 + 0.06 * s, vol: 0.12 });
+                   this.noise({ f0: 2600, f1: 220, dur: 0.1 + 0.06 * s, vol: 0.1 }); },
+    explosion(s = 1) { this.noise({ f0: 3200, f1: 60,  dur: 0.45 + 0.25 * s, vol: 0.4 });
+                       this.voice({ type: 'sine', f0: 140, f1: 32, dur: 0.35 + 0.2 * s, vol: 0.35 }); },
+    playerDeath(){ this.explosion(1.6);
+                   this.voice({ type: 'sawtooth', f0: 320, f1: 36, dur: 0.9, vol: 0.22 });
+                   this.noise({ ftype: 'bandpass', f0: 900, f1: 90, dur: 0.7, vol: 0.2, q: 1.2 }); },
+    dash()       { this.noise({ ftype: 'bandpass', f0: 320, f1: 4600, dur: 0.2, vol: 0.22, q: 1.6 });
+                   this.voice({ type: 'sine', f0: 200, f1: 900, dur: 0.12, vol: 0.05 }); },
+    pickup()     { if (!this.ctx) return; const t = this.ctx.currentTime;
+                   this.voice({ type: 'sine', f0: 660, dur: 0.07, vol: 0.14, when: t });
+                   this.voice({ type: 'sine', f0: 990, dur: 0.10, vol: 0.14, when: t + 0.07 }); },
+    multUp(n)    { if (!this.ctx) return; const t = this.ctx.currentTime;
+                   for (let i = 0; i < 3; i++)
+                     this.voice({ type: 'triangle', f0: 480 * Math.pow(1.26, i + Math.min(3, n - 1)), dur: 0.09, vol: 0.1, when: t + i * 0.055 }); },
+    bomb()       { this.voice({ type: 'sine', f0: 58, f1: 26, dur: 1.1, vol: 0.55 });
+                   this.noise({ f0: 7000, f1: 120, dur: 0.9, vol: 0.4 });
+                   this.noise({ ftype: 'highpass', f0: 300, dur: 0.5, vol: 0.12 }); },
+    enemyShoot() { this.voice({ type: 'square', f0: 230, f1: 90, dur: 0.09, vol: 0.05 }); },
+    waveIn()     { if (!this.ctx) return; const t = this.ctx.currentTime;
+                   this.voice({ type: 'triangle', f0: 440, dur: 0.12, vol: 0.12, when: t });
+                   this.voice({ type: 'triangle', f0: 660, dur: 0.16, vol: 0.12, when: t + 0.11 });
+                   this.voice({ type: 'triangle', f0: 880, dur: 0.22, vol: 0.12, when: t + 0.22, echo: true }); },
+    wellPulse()  { this.voice({ type: 'sine', f0: 74, f1: 60, dur: 0.24, vol: 0.14 }); },
+
+    /* ---------- generative soundtrack ------------------------------ */
+    setIntensity(wave, state) {
+      this.intensity = state === 'playing' ? Math.min(1, 0.18 + wave * 0.05) : 0.1;
+      this.bpm = state === 'playing' ? Math.min(146, 108 + wave * 2) : 100;
+    },
+
+    _schedule() {
+      const ctx = this.ctx;
+      if (!ctx) return;
+      const sixteenth = (60 / this.bpm) / 4;
+      while (this.nextT < ctx.currentTime + 0.18) {
+        this._playStep(this.step, this.nextT);
+        this.step = (this.step + 1) % 64;
+        this.nextT += sixteenth;
+      }
+    },
+
+    /* One 16th note. Pattern (A minor, 4 bars of 16 steps):
+       pad chord every 2 bars, saw bass half-notes, sub kick off-beat,
+       pentatonic arps through a feedback delay, noise hats.            */
+    _playStep(s, t) {
+      const roots = [110, 87.31, 130.81, 98];                 // A2 F2 C3 G2
+      const penta = [220, 261.63, 293.66, 329.63, 392, 440];  // A min pentatonic
+      const bar = (s / 16) | 0, root = roots[bar], I = this.intensity, M = this.musicBus;
+
+      if (s % 32 === 0)
+        for (const mul of [2, 3.01])
+          this.voice({ type: 'sawtooth', f0: root * mul, dur: 2.2, vol: 0.028, attack: 0.9, lp: 620, when: t, dest: M });
+
+      if (s % 16 === 0 || s % 16 === 8)
+        this.voice({ type: 'sawtooth', f0: root, dur: 0.4, vol: 0.085, lp: 420, when: t, dest: M });
+
+      if (I > 0.3 && s % 8 === 4)
+        this.voice({ type: 'sine', f0: 72, f1: 40, dur: 0.13, vol: 0.1, when: t, dest: M });
+
+      if (s % 2 === 0 && Math.random() < 0.18 + I * 0.5) {
+        const f = penta[(s * 5 + bar * 3) % 6] * (Math.random() < 0.25 ? 2 : 1);
+        this.voice({ type: 'triangle', f0: f, dur: 0.16, vol: 0.045, when: t, echo: true, dest: M });
+      }
+
+      if (I > 0.5 && s % 2 === 1)
+        this.noise({ ftype: 'highpass', f0: 6500, dur: 0.03, vol: 0.022, when: t, dest: M });
+    },
+  };
+
+  window.NV.Audio = Audio;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/input.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — input.js
+   Unified keyboard + mouse + gamepad input with edge-trigger
+   ("consume") semantics so a single keypress never fires twice.
+   ============================================================ */
+(function () {
+  const Input = {
+    keys: Object.create(null),
+    pressed: Object.create(null),
+    mouse: { x: 0, y: 0, wx: 0, wy: 0, down: false, rEdge: false, mEdge: false },
+    pad: null, padEdge: Object.create(null), _padPrev: Object.create(null),
+
+    init(canvas) {
+      this.mouse.wx = NV.CONFIG.WORLD_W / 2;
+      this.mouse.wy = NV.CONFIG.WORLD_H / 2;
+
+      window.addEventListener('keydown', (e) => {
+        if (this._blockable(e.code)) e.preventDefault();
+        if (e.repeat) return;
+        this.keys[e.code] = true;
+        this.pressed[e.code] = true;
+      });
+      window.addEventListener('keyup', (e) => { this.keys[e.code] = false; });
+      window.addEventListener('blur', () => { this.keys = Object.create(null); });
+
+      canvas.addEventListener('mousemove', (e) => {
+        const m = this.mouse;
+        m.x = e.clientX; m.y = e.clientY;
+        const w = NV.Render.screenToWorld(e.clientX, e.clientY);
+        m.wx = w.x; m.wy = w.y;
+      });
+      canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 0) this.mouse.down = true;
+        if (e.button === 2) this.mouse.rEdge = true;
+        if (e.button === 1) { this.mouse.mEdge = true; e.preventDefault(); }
+      });
+      window.addEventListener('mouseup', (e) => { if (e.button === 0) this.mouse.down = false; });
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    },
+
+    /* Keys whose default action (scrolling, button activation) we swallow. */
+    _blockable(code) { return code === 'Space' || code.startsWith('Arrow'); },
+
+    /* Edge-triggered key press: true at most once per press. */
+    consume(code) {
+      if (this.pressed[code]) { this.pressed[code] = false; return true; }
+      return false;
+    },
+
+    update() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      this.pad = null;
+      for (const p of pads) if (p && p.connected) { this.pad = p; break; }
+      this.padEdge = Object.create(null);
+      const p = this.pad;
+      if (p) {
+        for (let i = 0; i < p.buttons.length; i++) {
+          const now = !!(p.buttons[i] && p.buttons[i].pressed);
+          if (now && !this._padPrev[i]) this.padEdge[i] = true;
+          this._padPrev[i] = now;
+        }
+      }
+    },
+
+    endFrame() {
+      this.pressed = Object.create(null);
+      this.mouse.rEdge = false;
+      this.mouse.mEdge = false;
+    },
+
+    /* Movement vector from WASD / arrows / left stick, normalized to len<=1. */
+    moveAxis() {
+      let x = 0, y = 0;
+      if (this.keys.KeyA || this.keys.ArrowLeft)  x -= 1;
+      if (this.keys.KeyD || this.keys.ArrowRight) x += 1;
+      if (this.keys.KeyW || this.keys.ArrowUp)    y -= 1;
+      if (this.keys.KeyS || this.keys.ArrowDown)  y += 1;
+      const p = this.pad;
+      if (p) {
+        const ax = p.axes[0] || 0, ay = p.axes[1] || 0;
+        if (Math.abs(ax) > 0.22) x += ax;
+        if (Math.abs(ay) > 0.22) y += ay;
+      }
+      const l = Math.hypot(x, y);
+      if (l > 1) { x /= l; y /= l; }
+      return { x, y };
+    },
+
+    firing() {
+      let f = this.mouse.down;
+      const p = this.pad;
+      if (p) {
+        if (p.buttons[7] && p.buttons[7].value > 0.4) f = true;
+        if (p.buttons[0] && p.buttons[0].pressed) f = true;
+      }
+      return f;
+    },
+
+    /* Aim toward mouse, or right stick if one is active (twin-stick). */
+    aimAngle(px, py) {
+      const p = this.pad;
+      if (p) {
+        const ax = p.axes[2] || 0, ay = p.axes[3] || 0;
+        if (Math.hypot(ax, ay) > 0.35) return Math.atan2(ay, ax);
+      }
+      return Math.atan2(this.mouse.wy - py, this.mouse.wx - px);
+    },
+  };
+
+  window.NV.Input = Input;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/grid.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — grid.js
+   The warping background lattice: every point is a damped spring
+   anchored to its rest position. Explosions, thrust, bombs and
+   black holes push ripples through it. Runs on fixed 120 Hz
+   sub-steps so behavior is identical at any frame rate.
+   ============================================================ */
+(function () {
+  const Grid = {
+    pts: [], cols: 0, rows: 0, spacing: 40, _acc: 0,
+
+    init() {
+      const C = NV.CONFIG, sp = this.spacing = C.GRID_SPACING;
+      this.cols = Math.round(C.WORLD_W / sp) + 1;
+      this.rows = Math.round(C.WORLD_H / sp) + 1;
+      this.pts = [];
+      const ox = (C.WORLD_W - (this.cols - 1) * sp) / 2;
+      const oy = (C.WORLD_H - (this.rows - 1) * sp) / 2;
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const x = ox + c * sp, y = oy + r * sp;
+          this.pts.push({ x, y, ox: x, oy: y, vx: 0, vy: 0 });
+        }
+      }
+    },
+
+    /* Radial push (negative strength = implosion pull). */
+    pulse(x, y, radius, strength) {
+      const r2 = radius * radius;
+      for (const p of this.pts) {
+        const dx = p.x - x, dy = p.y - y, d2 = dx * dx + dy * dy;
+        if (d2 > r2 || d2 < 1e-6) continue;
+        const d = Math.sqrt(d2);
+        const f = strength * (1 - d / radius) / d;
+        p.vx += dx * f; p.vy += dy * f;
+      }
+    },
+
+    update(dt) {
+      this._acc = Math.min(this._acc + dt, 0.1);
+      const step = 1 / 120;
+      while (this._acc >= step) { this._acc -= step; this._step(); }
+    },
+
+    _step() {
+      const K = 0.02, D = 0.975;   // spring constant / damping per substep
+      for (const p of this.pts) {
+        p.vx = (p.vx + (p.ox - p.x) * K) * D;
+        p.vy = (p.vy + (p.oy - p.y) * K) * D;
+        p.x += p.vx; p.y += p.vy;
+      }
+    },
+
+    draw(c) {
+      const { cols, rows, pts } = this;
+      c.globalCompositeOperation = 'source-over';
+
+      // base lattice — one path per direction
+      c.strokeStyle = NV.PALETTE.grid;
+      c.lineWidth = 1;
+      c.beginPath();
+      for (let r = 0; r < rows; r++) {
+        const o = r * cols;
+        c.moveTo(pts[o].x, pts[o].y);
+        for (let i = 1; i < cols; i++) c.lineTo(pts[o + i].x, pts[o + i].y);
+      }
+      for (let col = 0; col < cols; col++) {
+        c.moveTo(pts[col].x, pts[col].y);
+        for (let i = 1; i < rows; i++) { const p = pts[i * cols + col]; c.lineTo(p.x, p.y); }
+      }
+      c.stroke();
+
+      // energized segments — only where the lattice is displaced
+      c.strokeStyle = NV.PALETTE.gridHot;
+      c.lineWidth = 1.5;
+      c.beginPath();
+      const disp = (p) => Math.abs(p.x - p.ox) + Math.abs(p.y - p.oy);
+      for (let r = 0; r < rows; r++) {
+        const o = r * cols;
+        for (let i = 0; i < cols - 1; i++) {
+          const p = pts[o + i], q = pts[o + i + 1];
+          if (disp(p) + disp(q) > 6) { c.moveTo(p.x, p.y); c.lineTo(q.x, q.y); }
+        }
+      }
+      for (let col = 0; col < cols; col++) {
+        for (let i = 0; i < rows - 1; i++) {
+          const p = pts[i * cols + col], q = pts[(i + 1) * cols + col];
+          if (disp(p) + disp(q) > 6) { c.moveTo(p.x, p.y); c.lineTo(q.x, q.y); }
+        }
+      }
+      c.stroke();
+    },
+  };
+
+  window.NV.Grid = Grid;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/particles.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — particles.js
+   Fully pooled particle system: glowing dots, velocity streaks,
+   spinning outline shards (enemies shatter into their own
+   geometry), expanding rings and floating score text.
+   ============================================================ */
+(function () {
+  const { rand, TAU, clamp } = NV.U;
+
+  const Fx = {
+    parts: [], pool: [], texts: [],
+
+    reset() { this.parts.length = 0; this.texts.length = 0; this.pool.length = 0; },
+
+    _get() {
+      if (this.parts.length >= NV.CONFIG.MAX_PARTICLES) return null;
+      const p = this.pool.pop();
+      if (p) { p.dead = false; return p; }
+      return { x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 0, size: 0, color: '', type: '', drag: 0, rot: 0, vr: 0, width: 0, dead: false };
+    },
+
+    dot(x, y, color, opts = {}) {
+      const p = this._get(); if (!p) return;
+      const a = opts.a !== undefined ? opts.a : rand(TAU);
+      const sp = opts.sp !== undefined ? opts.sp : rand(30, 240);
+      p.type = 'dot'; p.x = x; p.y = y;
+      p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
+      p.life = p.max = opts.life || rand(0.3, 0.8);
+      p.size = opts.size || rand(1.5, 3.5);
+      p.color = color; p.drag = 2.2; p.rot = 0; p.vr = 0;
+      this.parts.push(p);
+    },
+
+    /* A short streak flying in the given direction (muzzle flashes etc.). */
+    spark(x, y, color, a, opts = {}) {
+      const p = this._get(); if (!p) return;
+      const sp = opts.sp !== undefined ? opts.sp : rand(200, 500);
+      p.type = 'spark'; p.x = x; p.y = y;
+      p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp;
+      p.life = p.max = opts.life || 0.18;
+      p.size = opts.size || 2.5;
+      p.color = color; p.drag = 4; p.rot = 0; p.vr = 0;
+      this.parts.push(p);
+    },
+
+    /* One segment of a dying shape's outline: flies outward from the
+       death point, spinning, keeping its original length. */
+    shard(x, y, ang, len, color, cx, cy) {
+      const p = this._get(); if (!p) return;
+      const dx = x - cx, dy = y - cy;
+      const d = Math.hypot(dx, dy) || 1;
+      const sp = rand(90, 320);
+      p.type = 'shard'; p.x = x; p.y = y;
+      p.vx = (dx / d) * sp + rand(-60, 60);
+      p.vy = (dy / d) * sp + rand(-60, 60);
+      p.life = p.max = rand(0.45, 0.9);
+      p.size = len; p.color = color;
+      p.rot = ang; p.vr = rand(-9, 9); p.drag = 1.6;
+      this.parts.push(p);
+    },
+
+    /* Expanding ring (size = radius, rot doubles as expansion speed). */
+    ring(x, y, color, r0, speed, life = 0.5, width = 2) {
+      const p = this._get(); if (!p) return;
+      p.type = 'ring'; p.x = x; p.y = y; p.vx = 0; p.vy = 0;
+      p.life = p.max = life; p.size = r0; p.rot = speed; p.vr = 0;
+      p.color = color; p.width = width; p.drag = 0;
+      this.parts.push(p);
+    },
+
+    text(x, y, str, color, size = 15) {
+      this.texts.push({ x, y, str, color, size, life: 1, max: 1, vy: -46, dead: false });
+    },
+
+    burst(x, y, color, n, sp = 260, opts = {}) {
+      for (let i = 0; i < n; i++)
+        this.dot(x, y, color, Object.assign({ sp: rand(sp * 0.25, sp) }, opts));
+    },
+
+    /* Shatter a world-space polygon outline into shards. */
+    shatter(pts, color, cx, cy) {
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        if (len < 2) continue;
+        this.shard((a[0] + b[0]) / 2, (a[1] + b[1]) / 2,
+          Math.atan2(b[1] - a[1], b[0] - a[0]), len, color, cx, cy);
+      }
+    },
+
+    update(dt) {
+      const ps = this.parts;
+      for (let i = 0; i < ps.length; i++) {
+        const p = ps[i];
+        p.life -= dt;
+        if (p.life <= 0) { p.dead = true; continue; }
+        if (p.type === 'ring') { p.size += p.rot * dt; continue; }
+        const k = 1 / (1 + p.drag * dt);
+        p.vx *= k; p.vy *= k;
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        if (p.vr) p.rot += p.vr * dt;
+      }
+      let j = 0;
+      for (let i = 0; i < ps.length; i++) {
+        const p = ps[i];
+        if (p.dead) this.pool.push(p); else ps[j++] = p;
+      }
+      ps.length = j;
+
+      for (const t of this.texts) {
+        t.life -= dt;
+        t.y += t.vy * dt;
+        t.vy *= 1 / (1 + 2 * dt);
+        if (t.life <= 0) t.dead = true;
+      }
+      NV.U.compact(this.texts);
+    },
+
+    draw(c) {
+      c.globalCompositeOperation = 'lighter';
+      for (const p of this.parts) {
+        const a = clamp(p.life / p.max, 0, 1);
+        if (p.type === 'dot') {
+          c.globalAlpha = a; c.fillStyle = p.color;
+          c.beginPath(); c.arc(p.x, p.y, Math.max(0.1, p.size * a), 0, TAU); c.fill();
+        } else if (p.type === 'spark') {
+          c.globalAlpha = a; c.strokeStyle = p.color; c.lineWidth = Math.max(0.5, p.size * a); c.lineCap = 'round';
+          c.beginPath(); c.moveTo(p.x, p.y); c.lineTo(p.x - p.vx * 0.03, p.y - p.vy * 0.03); c.stroke();
+        } else if (p.type === 'shard') {
+          c.globalAlpha = a; c.strokeStyle = p.color; c.lineWidth = 1.8; c.lineCap = 'round';
+          const h = p.size * 0.5, cx = Math.cos(p.rot) * h, sy = Math.sin(p.rot) * h;
+          c.beginPath(); c.moveTo(p.x - cx, p.y - sy); c.lineTo(p.x + cx, p.y + sy); c.stroke();
+        } else if (p.type === 'ring') {
+          c.globalAlpha = a * 0.8; c.strokeStyle = p.color; c.lineWidth = (p.width || 2) * a + 0.5;
+          c.beginPath(); c.arc(p.x, p.y, Math.max(0.1, p.size), 0, TAU); c.stroke();
+        }
+      }
+      c.globalCompositeOperation = 'source-over';
+      for (const t of this.texts) {
+        c.globalAlpha = clamp(t.life / t.max, 0, 1);
+        c.font = `700 ${t.size}px system-ui, sans-serif`;
+        c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillStyle = t.color; c.shadowColor = t.color; c.shadowBlur = 8;
+        c.fillText(t.str, t.x, t.y);
+        c.shadowBlur = 0;
+      }
+      c.globalAlpha = 1; c.textAlign = 'left';
+    },
+  };
+
+  window.NV.Fx = Fx;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/entities.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — entities.js
+   The player ship, bullets, pickups and eight enemy archetypes,
+   each with distinct steering AI:
+
+     seeker    — relentless direct pursuit
+     weaver    — sinusoidal curved approach
+     drifter   — bounces around the arena, ignores you
+     splitter  — slow tank; bursts into three fast minis
+     dodger    — pursues, but actively flees your bullets
+     sentinel  — keeps its distance and fires 3-round bursts
+     pinwheel  — telegraphs, then dashes at your position
+     well      — gravity well; drags you, your bullets and
+                 everything else toward it; destabilizes if ignored
+
+   Every enemy is a vector outline; on death the outline itself
+   shatters into spinning shard particles.
+   ============================================================ */
+(function () {
+  const U = NV.U, Fx = NV.Fx, Grid = NV.Grid, Render = NV.Render, A = NV.Audio;
+  const T = NV.TUNE.player, PAL = NV.PALETTE;
+
+  /* ------------------------------------------------------------------ */
+  /* Enemy archetypes                                                     */
+  /* ------------------------------------------------------------------ */
+  const DEFS = {
+    seeker:   { color: '#ff3ec8', r: 13, hp: 1,  score: 50,  cost: 1,   shape: U.poly(4, -Math.PI / 2), spin: 1.4, acc: 900,  maxV: 165 },
+    weaver:   { color: '#31e5ff', r: 12, hp: 1,  score: 75,  cost: 1.5, shape: U.poly(3, -Math.PI / 2), acc: 1500, maxV: 245 },
+    drifter:  { color: '#ffb020', r: 16, hp: 2,  score: 60,  cost: 1,   shape: U.poly(5), spin: 1.0, maxV: 95 },
+    splitter: { color: '#ffe93c', r: 19, hp: 2,  score: 90,  cost: 2,   shape: U.poly(4, Math.PI / 4), spin: 1.8, acc: 420, maxV: 90 },
+    mini:     { color: '#ffe93c', r: 9,  hp: 1,  score: 40,  cost: 0,   shape: U.poly(4, Math.PI / 4), spin: 3.2, acc: 1250, maxV: 240 },
+    dodger:   { color: '#5cff5c', r: 12, hp: 1,  score: 120, cost: 2,   shape: [[1.15, 0], [-0.65, 0.85], [-0.25, 0], [-0.65, -0.85]], acc: 1400, maxV: 215 },
+    sentinel: { color: '#b26cff', r: 15, hp: 3,  score: 150, cost: 3,   shape: U.poly(6), spin: 0.5, acc: 900, maxV: 170 },
+    pinwheel: { color: '#ff5040', r: 14, hp: 2,  score: 130, cost: 2.5, shape: U.star(4, 0.42), spin: 7, maxV: 560 },
+    well:     { color: '#8fd0ff', r: 21, hp: 10, score: 500, cost: 4,   shape: U.poly(10), spin: -0.4, maxV: 26 },
+  };
+
+  class Enemy {
+    constructor(type, x, y, opts = {}) {
+      const d = DEFS[type];
+      this.type = type; this.def = d;
+      this.x = x; this.y = y;
+      this.vx = opts.vx || 0; this.vy = opts.vy || 0;
+      this.r = d.r;
+      this.hp = this.maxHp = Math.ceil(d.hp * (opts.hpMul || 1));
+      this.t = U.rand(10); this.rot = U.rand(U.TAU);
+      this.spin = (d.spin || 0) * (Math.random() < 0.5 ? -1 : 1) * (0.7 + Math.random() * 0.6);
+      this.state = opts.instant ? 'active' : 'spawn';
+      this.st = 0; this.flash = 0; this.dead = false; this.hitBy = 0;
+      this.fireT = U.rand(1.2, 2.4); this.telegraph = 0;
+      this.phase = 'wait'; this.phaseT = U.rand(0.5, 1.1); this.aimA = 0;
+      this.wander = U.rand(U.TAU);
+      if (type === 'well') this.fireT = 13;   // destabilization countdown
+    }
+
+    /* The enemy's outline in world space (used for drawing and shattering). */
+    worldShape() {
+      const d = this.def, cs = Math.cos(this.rot), sn = Math.sin(this.rot), r = this.r;
+      return d.shape.map(p => [this.x + (p[0] * cs - p[1] * sn) * r, this.y + (p[0] * sn + p[1] * cs) * r]);
+    }
+
+    update(dt, g) {
+      this.t += dt;
+      this.flash = Math.max(0, this.flash - dt * 8);
+
+      /* Attract-mode drift on the menu screen. */
+      if (this.state === 'menu') {
+        this.rot += this.spin * dt;
+        this.x += this.vx * dt; this.y += this.vy * dt;
+        this.confine(g, true);
+        return;
+      }
+
+      const d = this.def, p = g.player;
+      if (this.state === 'spawn') {           // harmless warp-in telegraph
+        this.st += dt;
+        if (this.st >= 0.55) this.state = 'active';
+        return;
+      }
+
+      let ax = 0, ay = 0;
+      const dx = p.x - this.x, dy = p.y - this.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      const ux = dx / dist, uy = dy / dist;
+
+      switch (this.type) {
+        case 'seeker': case 'mini': case 'splitter':
+          ax = ux * d.acc; ay = uy * d.acc;
+          this.rot += this.spin * dt;
+          break;
+
+        case 'weaver': {                       // curved, hard-to-track approach
+          const a = Math.atan2(uy, ux) + Math.sin(this.t * 2.7) * 0.85;
+          ax = Math.cos(a) * d.acc; ay = Math.sin(a) * d.acc;
+          break;
+        }
+
+        case 'drifter':
+          if (!this.vx && !this.vy) {
+            const a = U.rand(U.TAU);
+            this.vx = Math.cos(a) * d.maxV; this.vy = Math.sin(a) * d.maxV;
+          }
+          this.rot += this.spin * dt;
+          break;
+
+        case 'dodger': {                       // bullet-aware evasion
+          ax = ux * d.acc; ay = uy * d.acc;
+          for (const b of g.bullets) {
+            const bx = this.x - b.x, by = this.y - b.y, bd = Math.hypot(bx, by);
+            if (bd < 170 && bd > 0.01) {
+              const w = (1 - bd / 170) * 2600 / bd;
+              ax += bx * w; ay += by * w;
+            }
+          }
+          if (Math.hypot(this.vx, this.vy) > 1) this.rot = Math.atan2(this.vy, this.vx);
+          break;
+        }
+
+        case 'sentinel': {                     // stand-off + burst fire
+          const want = 380;
+          const radial = dist > want + 40 ? 1 : (dist < want - 40 ? -1 : 0);
+          const tang = Math.sin(this.t * 0.8) * 0.9;
+          ax = (ux * radial + -uy * tang) * d.acc;
+          ay = (uy * radial +  ux * tang) * d.acc;
+          this.rot += this.spin * dt;
+          this.fireT -= dt;
+          this.telegraph = this.fireT < 0.5 ? 1 - this.fireT / 0.5 : 0;
+          if (this.fireT <= 0) {
+            const base = Math.atan2(dy, dx);
+            for (let i = -1; i <= 1; i++) g.spawnEBullet(this.x, this.y, base + i * 0.12, 330);
+            A.enemyShoot();
+            this.fireT = U.rand(2.0, 3.0);
+          }
+          break;
+        }
+
+        case 'pinwheel': {                     // charge, telegraph, dash
+          this.rot += this.spin * dt;
+          this.phaseT -= dt;
+          if (this.phase === 'wait') {
+            this.vx *= 1 / (1 + 8 * dt); this.vy *= 1 / (1 + 8 * dt);
+            this.aimA = Math.atan2(dy, dx);
+            if (this.phaseT <= 0) {
+              this.phase = 'dash'; this.phaseT = 0.42;
+              this.vx = Math.cos(this.aimA) * d.maxV;
+              this.vy = Math.sin(this.aimA) * d.maxV;
+            }
+          } else if (this.phaseT <= 0) {
+            this.phase = 'wait'; this.phaseT = U.rand(0.6, 1.0);
+            this.vx *= 0.25; this.vy *= 0.25;
+          }
+          break;
+        }
+
+        case 'well': {                         // gravity source
+          this.wander += U.rand(-1, 1) * dt * 2;
+          this.vx = U.lerp(this.vx, Math.cos(this.wander) * d.maxV, dt);
+          this.vy = U.lerp(this.vy, Math.sin(this.wander) * d.maxV, dt);
+          this.rot += this.spin * dt;
+          this.fireT -= dt;
+          if (this.fireT <= 0) this.die(false, g);   // destabilize
+          if (((this.t * 2) | 0) !== (((this.t - dt) * 2) | 0)) A.wellPulse();
+          break;
+        }
+      }
+
+      if (d.acc) { this.vx += ax * dt; this.vy += ay * dt; }
+      const mv = Math.hypot(this.vx, this.vy), cap = d.maxV;
+      if (mv > cap) { this.vx = this.vx / mv * cap; this.vy = this.vy / mv * cap; }
+      this.x += this.vx * dt; this.y += this.vy * dt;
+      this.confine(g);
+    }
+
+    confine(g, bounce) {
+      const W = NV.CONFIG.WORLD_W, H = NV.CONFIG.WORLD_H, m = this.r + 6;
+      if (bounce || this.type === 'drifter' || this.type === 'well') {
+        if (this.x < m) { this.x = m; this.vx = Math.abs(this.vx); }
+        else if (this.x > W - m) { this.x = W - m; this.vx = -Math.abs(this.vx); }
+        if (this.y < m) { this.y = m; this.vy = Math.abs(this.vy); }
+        else if (this.y > H - m) { this.y = H - m; this.vy = -Math.abs(this.vy); }
+      } else {
+        this.x = U.clamp(this.x, m, W - m);
+        this.y = U.clamp(this.y, m, H - m);
+      }
+    }
+
+    hurt(dmg, dirx, diry, g) {
+      this.hp -= dmg; this.flash = 1;
+      const kb = this.type === 'well' ? 10 : 70;   // wells are heavy
+      if (dirx) { this.vx += dirx * kb; this.vy += diry * kb; }
+      if (this.hp <= 0) { this.die(true, g); return true; }
+      A.enemyHit();
+      Fx.dot(this.x, this.y, this.def.color, { sp: 120, life: 0.25, size: 2 });
+      return false;
+    }
+
+    die(byPlayer, g) {
+      if (this.dead) return;
+      this.dead = true;
+      const d = this.def, big = this.r >= 16 ? 1 : 0.55;
+      Fx.shatter(this.worldShape(), d.color, this.x, this.y);
+      Fx.burst(this.x, this.y, d.color, 8 + ((this.r / 2) | 0), 300);
+      Fx.ring(this.x, this.y, d.color, this.r * 0.5, 620, 0.35);
+      Grid.pulse(this.x, this.y, 130 + this.r * 3, 90 + this.r * 4);
+      g.addTrauma(0.06 + this.r * 0.004);
+
+      if (byPlayer) {
+        g.score += d.score * g.mult;
+        g.kills++;
+        if (d.score >= 100) Fx.text(this.x, this.y, '+' + (d.score * g.mult), d.color, 14);
+        g.freeze = Math.max(g.freeze, d.score >= 130 ? 0.05 : 0.025);   // hit-stop
+        A.enemyDie(big);
+        g.dropLoot(this);
+      } else {
+        A.explosion(0.7);
+      }
+
+      if (this.type === 'splitter') {
+        for (let i = 0; i < 3; i++) {
+          const a = (i / 3) * U.TAU + U.rand(0.5);
+          g.enemies.push(new Enemy('mini',
+            this.x + Math.cos(a) * 14, this.y + Math.sin(a) * 14,
+            { instant: true, vx: Math.cos(a) * 220, vy: Math.sin(a) * 220 }));
+        }
+      }
+
+      if (this.type === 'well') {
+        A.explosion(1.6);
+        Fx.ring(this.x, this.y, '#ffffff', this.r, 1400, 0.6, 3);
+        Grid.pulse(this.x, this.y, 480, -620);   // implosion ripple
+        g.addTrauma(0.5);
+        g.freeze = 0.09;
+        if (byPlayer) {
+          g.spawnPickup(U.pick(['triple', 'rapid', 'shield', 'bomb']), this.x, this.y);
+        } else {                                   // destabilized: bullet ring
+          for (let i = 0; i < 10; i++) g.spawnEBullet(this.x, this.y, (i / 10) * U.TAU, 300);
+          Fx.ring(this.x, this.y, PAL.ebullet, this.r, 900, 0.5, 3);
+        }
+      }
+    }
+
+    draw(c, g) {
+      const d = this.def;
+      let alpha = 1, scale = 1;
+
+      if (this.state === 'spawn') {
+        const k = U.easeOut(U.clamp(this.st / 0.55, 0, 1));
+        alpha = 0.15 + 0.85 * k; scale = 0.25 + 0.75 * k;
+        Render.neonCircle(this.x, this.y, this.r * (2.2 - 1.2 * k), d.color, 1.5, (1 - k) * 0.7);
+      }
+
+      const col = this.flash > 0.05 ? '#ffffff' : d.color;
+
+      /* Telegraphs. */
+      if (this.type === 'sentinel' && this.telegraph > 0 && g.player) {
+        const aim = Math.atan2(g.player.y - this.y, g.player.x - this.x);
+        Render.drawGlow(this.x, this.y, this.r * (2 + this.telegraph), d.color, this.telegraph * 0.5);
+        c.save();
+        c.globalAlpha = this.telegraph * 0.55;
+        c.strokeStyle = PAL.ebullet; c.lineWidth = 1.3;
+        c.setLineDash([5, 9]);
+        c.beginPath();
+        c.moveTo(this.x + Math.cos(aim) * this.r, this.y + Math.sin(aim) * this.r);
+        c.lineTo(this.x + Math.cos(aim) * 150, this.y + Math.sin(aim) * 150);
+        c.stroke();
+        c.restore();
+      }
+      if (this.type === 'pinwheel' && this.phase === 'wait' && this.state === 'active') {
+        c.save();
+        c.globalAlpha = 0.22 + 0.18 * Math.sin(this.t * 14);
+        c.strokeStyle = d.color; c.lineWidth = 1.2;
+        c.setLineDash([6, 8]);
+        c.beginPath();
+        c.moveTo(this.x, this.y);
+        c.lineTo(this.x + Math.cos(this.aimA) * 120, this.y + Math.sin(this.aimA) * 120);
+        c.stroke();
+        c.restore();
+      }
+
+      if (this.type === 'well') {
+        const pulse = 1 + Math.sin(this.t * 6) * 0.05;
+        Render.drawGlow(this.x, this.y, this.r * 3.2 * pulse, d.color, 0.5 * alpha);
+        Render.neonCircle(this.x, this.y, this.r * pulse, col, 2, alpha);
+        Render.neonCircle(this.x, this.y, this.r * 0.55, col, 1.5, alpha * 0.8);
+        c.globalAlpha = alpha; c.fillStyle = '#ffffff';
+        for (let i = 0; i < 3; i++) {
+          const a = this.t * 2.2 + (i / 3) * U.TAU;
+          c.beginPath();
+          c.arc(this.x + Math.cos(a) * this.r * 1.6, this.y + Math.sin(a) * this.r * 1.6, 2, 0, U.TAU);
+          c.fill();
+        }
+        c.globalAlpha = 1;
+        return;
+      }
+
+      const cs = Math.cos(this.rot), sn = Math.sin(this.rot), rr = this.r * scale;
+      const pts = d.shape.map(p => [this.x + (p[0] * cs - p[1] * sn) * rr, this.y + (p[0] * sn + p[1] * cs) * rr]);
+      Render.drawGlow(this.x, this.y, this.r * 2.4, d.color, 0.22 * alpha);
+      Render.neon(pts, col, 2, alpha, true);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Pickups                                                              */
+  /* ------------------------------------------------------------------ */
+  const PICKUPS = {
+    gem:    { color: '#5cff8f', r: 8,  label: '' },
+    triple: { color: '#ffd23c', r: 11, label: 'T' },
+    rapid:  { color: '#ff5cf0', r: 11, label: 'R' },
+    shield: { color: '#45b0ff', r: 11, label: 'S' },
+    life:   { color: '#ffffff', r: 11, label: '+' },
+    bomb:   { color: '#ffb020', r: 11, label: 'B' },
+  };
+
+  class Pickup {
+    constructor(kind, x, y) {
+      this.kind = kind; this.x = x; this.y = y;
+      this.vx = U.rand(-40, 40); this.vy = U.rand(-40, 40);
+      this.t = U.rand(10); this.life = 9; this.dead = false;
+      this.r = PICKUPS[kind].r;
+    }
+
+    update(dt, g) {
+      this.t += dt; this.life -= dt;
+      if (this.life <= 0) { this.dead = true; return; }
+      const p = g.player;
+      if (p && !p.dead) {
+        const dx = p.x - this.x, dy = p.y - this.y, d = Math.hypot(dx, dy);
+        if (d < NV.TUNE.magnetDist && d > 0.1) {
+          this.vx += dx / d * 1800 * dt;
+          this.vy += dy / d * 1800 * dt;
+        }
+        if (d < p.r + this.r + 4) { this.collect(g); return; }
+      }
+      const k = 1 / (1 + 3.2 * dt);
+      this.vx *= k; this.vy *= k;
+      this.x += this.vx * dt; this.y += this.vy * dt;
+      this.x = U.clamp(this.x, 14, NV.CONFIG.WORLD_W - 14);
+      this.y = U.clamp(this.y, 14, NV.CONFIG.WORLD_H - 14);
+    }
+
+    collect(g) {
+      this.dead = true;
+      const k = PICKUPS[this.kind], p = g.player;
+      if (this.kind === 'gem') {
+        if (g.mult < NV.TUNE.multiplierMax) {
+          g.mult++; g.multPulse = 1;
+          Fx.text(this.x, this.y, 'x' + g.mult, k.color, 20);
+          A.multUp(g.mult);
+        } else {
+          g.score += 100;
+          Fx.text(this.x, this.y, '+100', k.color, 16);
+          A.pickup();
+        }
+      } else if (this.kind === 'triple') {
+        p.powerTriple = NV.TUNE.powerupTime;
+        Fx.text(this.x, this.y, 'TRIPLE SHOT', k.color, 16); A.pickup();
+      } else if (this.kind === 'rapid') {
+        p.powerRapid = NV.TUNE.powerupTime;
+        Fx.text(this.x, this.y, 'RAPID FIRE', k.color, 16); A.pickup();
+      } else if (this.kind === 'shield') {
+        p.shield = true;
+        Fx.text(this.x, this.y, 'SHIELD', k.color, 16); A.pickup();
+      } else if (this.kind === 'life') {
+        if (p.lives < NV.TUNE.player.maxLives) p.lives++;
+        Fx.text(this.x, this.y, 'EXTRA LIFE', k.color, 16); A.pickup();
+      } else if (this.kind === 'bomb') {
+        if (g.bombs < NV.TUNE.player.maxBombs) g.bombs++;
+        Fx.text(this.x, this.y, '+BOMB', k.color, 16); A.pickup();
+      }
+      Fx.ring(this.x, this.y, k.color, 4, 380, 0.3);
+    }
+
+    draw(c) {
+      const k = PICKUPS[this.kind];
+      const blink = this.life < 2.5 ? (Math.sin(this.t * 18) > 0 ? 1 : 0.25) : 1;
+      const r = this.r * (1 + Math.sin(this.t * 5) * 0.12);
+      if (this.kind === 'gem') {
+        Render.neonPoly(this.x, this.y, r, 4, this.t * 1.5, k.color, 2, blink);
+        Render.drawGlow(this.x, this.y, r * 2.2, k.color, 0.35 * blink);
+      } else {
+        Render.neonCircle(this.x, this.y, r, k.color, 2, blink);
+        Render.neonPoly(this.x, this.y, r * 0.45, 4, Math.PI / 4, k.color, 1.2, blink);
+        c.font = '800 11px system-ui, sans-serif';
+        c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.fillStyle = '#ffffff'; c.globalAlpha = blink;
+        c.fillText(k.label, this.x, this.y + 0.5);
+        c.globalAlpha = 1; c.textAlign = 'left';
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Player                                                               */
+  /* ------------------------------------------------------------------ */
+  const SHIP = [[1.45, 0], [-0.95, 0.8], [-0.45, 0], [-0.95, -0.8]];
+
+  function drawShip(x, y, a, color, alpha, scale, c) {
+    const cs = Math.cos(a), sn = Math.sin(a), r = T.radius * 1.6 * scale;
+    const pts = SHIP.map(p => [x + (p[0] * cs - p[1] * sn) * r, y + (p[0] * sn + p[1] * cs) * r]);
+    Render.neon(pts, PAL.player, 3.2, alpha * 0.5, true);   // glow pass
+    Render.neon(pts, color, 1.6, alpha, true);              // bright core
+  }
+
+  class Player {
+    constructor() {
+      this.x = NV.CONFIG.WORLD_W / 2;
+      this.y = NV.CONFIG.WORLD_H / 2;
+      this.vx = 0; this.vy = 0;
+      this.r = T.radius;
+      this.angle = -Math.PI / 2; this.aim = -Math.PI / 2;
+      this.lives = T.startLives;
+      this.dead = false; this.deadT = 0;
+      this.invuln = 2;
+      this.fireCd = 0; this.dashCd = 0; this.dashT = 0; this.dashA = 0;
+      this.ghosts = []; this.ghostT = 0;
+      this.powerTriple = 0; this.powerRapid = 0; this.shield = false;
+      this.thrust = 0;
+    }
+
+    update(dt, g) {
+      if (this.dead) {
+        this.deadT += dt;
+        if (this.lives >= 0 && this.deadT > 1.1 && g.state === 'playing') this.respawn(g);
+        return;
+      }
+      const I = NV.Input;
+      this.invuln = Math.max(0, this.invuln - dt);
+      this.fireCd -= dt; this.dashCd -= dt;
+      this.powerTriple = Math.max(0, this.powerTriple - dt);
+      this.powerRapid = Math.max(0, this.powerRapid - dt);
+
+      const mv = I.moveAxis();
+      this.thrust = Math.hypot(mv.x, mv.y);
+
+      if (this.dashT > 0) {
+        /* Blink: fixed velocity, invulnerable, leaves afterimages. */
+        this.dashT -= dt;
+        this.vx = Math.cos(this.dashA) * T.dashSpeed;
+        this.vy = Math.sin(this.dashA) * T.dashSpeed;
+        this.ghostT -= dt;
+        if (this.ghostT <= 0) {
+          this.ghosts.push({ x: this.x, y: this.y, angle: this.angle, life: 0.3, dead: false });
+          this.ghostT = 0.02;
+        }
+        if (this.dashT <= 0) { this.vx *= 0.3; this.vy *= 0.3; }
+      } else {
+        const wantDash = I.consume('ShiftLeft') || I.consume('ShiftRight') ||
+          I.mouse.rEdge || I.padEdge[5] || I.padEdge[1] || I.padEdge[6];
+        if (wantDash && this.dashCd <= 0) {
+          let ax = mv.x, ay = mv.y;
+          if (Math.hypot(ax, ay) < 0.2) { ax = Math.cos(this.aim); ay = Math.sin(this.aim); }
+          this.dashA = Math.atan2(ay, ax);
+          this.dashT = T.dashTime; this.dashCd = T.dashCd;
+          this.invuln = Math.max(this.invuln, T.dashTime + 0.08);
+          A.dash();
+          Grid.pulse(this.x, this.y, 140, -160);
+          Fx.burst(this.x, this.y, PAL.player, 10, 220, { life: 0.35 });
+        }
+        this.vx += mv.x * T.accel * dt;
+        this.vy += mv.y * T.accel * dt;
+        const k = 1 / (1 + T.drag * dt);
+        this.vx *= k; this.vy *= k;
+      }
+
+      const sp = Math.hypot(this.vx, this.vy);
+      if (sp > T.maxSpeed && this.dashT <= 0) {
+        this.vx = this.vx / sp * T.maxSpeed;
+        this.vy = this.vy / sp * T.maxSpeed;
+      }
+      this.x += this.vx * dt; this.y += this.vy * dt;
+      const W = NV.CONFIG.WORLD_W, H = NV.CONFIG.WORLD_H, m = this.r + 4;
+      this.x = U.clamp(this.x, m, W - m);
+      this.y = U.clamp(this.y, m, H - m);
+
+      /* Hull faces the aim direction (mouse / right stick). */
+      this.aim = I.aimAngle(this.x, this.y);
+      let da = this.aim - this.angle;
+      while (da > Math.PI) da -= U.TAU;
+      while (da < -Math.PI) da += U.TAU;
+      this.angle += da * Math.min(1, dt * 22);
+
+      if (I.firing() && this.fireCd <= 0) this.fire(g);
+
+      /* Engine exhaust. */
+      if ((this.thrust > 0.1 || this.dashT > 0) && Math.random() < 0.85) {
+        const bx = this.x - Math.cos(this.angle) * this.r * 1.5;
+        const by = this.y - Math.sin(this.angle) * this.r * 1.5;
+        Fx.dot(bx, by, Math.random() < 0.3 ? '#ffffff' : '#39c8ff',
+          { sp: U.rand(40, 150), life: U.rand(0.2, 0.45), size: U.rand(1.5, 2.6) });
+      }
+
+      for (const gh of this.ghosts) { gh.life -= dt; gh.dead = gh.life <= 0; }
+      U.compact(this.ghosts);
+    }
+
+    fire(g) {
+      this.fireCd = this.powerRapid > 0 ? T.fireCdRapid : T.fireCd;
+      const spread = this.powerTriple > 0 ? [-0.14, 0, 0.14] : [0];
+      for (const s of spread) {
+        const a = this.aim + s + U.rand(-0.012, 0.012);
+        g.bullets.push({
+          x: this.x + Math.cos(a) * 16, y: this.y + Math.sin(a) * 16,
+          px: this.x, py: this.y,
+          vx: Math.cos(a) * T.bulletSpeed, vy: Math.sin(a) * T.bulletSpeed,
+          life: T.bulletLife, r: 3.6, dead: false,
+        });
+      }
+      g.shots += spread.length;
+      A.shoot();
+      const nx = this.x + Math.cos(this.aim) * 18, ny = this.y + Math.sin(this.aim) * 18;
+      Grid.pulse(nx, ny, 60, 26);
+      Fx.spark(nx, ny, '#ffffff', this.aim, { sp: 60, life: 0.08, size: 3 });
+      this.vx -= Math.cos(this.aim) * 14;   // tiny recoil
+      this.vy -= Math.sin(this.aim) * 14;
+    }
+
+    takeHit(g) {
+      if (this.dead || this.invuln > 0) return;
+
+      if (this.shield) {
+        this.shield = false; this.invuln = T.hitInvuln;
+        A.explosion(0.5);
+        Fx.ring(this.x, this.y, '#45b0ff', this.r, 700, 0.4, 3);
+        Fx.burst(this.x, this.y, '#45b0ff', 26, 340);
+        g.addTrauma(0.35);
+        Grid.pulse(this.x, this.y, 200, 260);
+        return;
+      }
+
+      this.lives--;
+      this.dead = true; this.deadT = 0;
+      g.mult = 1;
+      A.playerDeath();
+      Fx.burst(this.x, this.y, '#ffffff', 50, 520);
+      Fx.burst(this.x, this.y, PAL.player, 40, 380);
+      Fx.ring(this.x, this.y, '#ffffff', 10, 1200, 0.7, 3);
+      Fx.ring(this.x, this.y, PAL.player, 10, 800, 0.9, 2);
+      /* The ship itself shatters like the enemies do. */
+      const cs = Math.cos(this.angle), sn = Math.sin(this.angle), r = this.r * 1.6;
+      Fx.shatter(SHIP.map(p => [this.x + (p[0] * cs - p[1] * sn) * r, this.y + (p[0] * sn + p[1] * cs) * r]),
+        PAL.player, this.x, this.y);
+      Grid.pulse(this.x, this.y, 420, 700);
+      g.addTrauma(0.85);
+      g.slowmo(0.25, 0.9);
+      g.flash = 0.7; g.flashColor = '#ff5a5a';
+
+      /* Clear the immediate area so respawn is not a coin flip. */
+      for (const e of g.enemies)
+        if (!e.dead && e.state === 'active' && U.dist2(e.x, e.y, this.x, this.y) < 260 * 260)
+          e.die(false, g);
+      for (const b of g.ebullets) b.dead = true;
+
+      if (this.lives < 0) g.gameOver();
+    }
+
+    respawn(g) {
+      this.dead = false; this.deadT = 0;
+      this.x = NV.CONFIG.WORLD_W / 2;
+      this.y = NV.CONFIG.WORLD_H / 2;
+      this.vx = this.vy = 0;
+      this.invuln = T.respawnInvuln;
+      this.dashT = 0; this.dashCd = 0;
+      Fx.ring(this.x, this.y, PAL.player, 8, 900, 0.6, 2);
+    }
+
+    draw(c, g) {
+      for (const gh of this.ghosts) {
+        const a = U.clamp(gh.life / 0.3, 0, 1);
+        drawShip(gh.x, gh.y, gh.angle, PAL.player, a * 0.5, 1.4, c);
+      }
+      if (this.dead) return;
+
+      const alpha = this.invuln > 0 ? (Math.sin(this.invuln * 24) > 0 ? 1 : 0.3) : 1;
+
+      /* Engine flame. */
+      if (this.thrust > 0.1 || this.dashT > 0) {
+        const flick = 0.7 + Math.random() * 0.6;
+        const tail = [[-0.5, 0], [-0.5 - 0.9 * flick, 0.32], [-0.5 - 1.3 * flick, 0], [-0.5 - 0.9 * flick, -0.32]];
+        const cs = Math.cos(this.angle), sn = Math.sin(this.angle), r = this.r;
+        Render.neon(tail.map(p => [this.x + (p[0] * cs - p[1] * sn) * r, this.y + (p[0] * sn + p[1] * cs) * r]),
+          '#ff9a3c', 1.6, alpha * 0.9, false);
+      }
+
+      Render.drawGlow(this.x, this.y, this.r * 3, PAL.player, 0.35 * alpha);
+      drawShip(this.x, this.y, this.angle, '#ffffff', alpha, 1, c);
+
+      if (this.shield)
+        Render.neonCircle(this.x, this.y, this.r + 9, '#45b0ff', 1.5, 0.5 + 0.3 * Math.sin(g.time * 6));
+    }
+  }
+
+  window.NV.Entities = { Enemy, Pickup, Player, DEFS, PICKUPS };
+})();
+
+</script>
+<script>
+/* ==== inlined: js/waves.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — waves.js
+   Wave director: each wave gets a "threat budget" that grows
+   with the wave number; enemies are drawn from an unlocking
+   pool and trickled into the arena in spawn clusters.
+   ============================================================ */
+(function () {
+  const U = NV.U;
+
+  /* Types available at (wave >= index). Wave 1 = seekers only. */
+  const UNLOCKS = [
+    [], ['weaver'], ['drifter', 'splitter'], ['dodger'],
+    ['sentinel'], ['pinwheel'], ['well'],
+  ];
+
+  const Waves = {
+    wave: 0, queue: [], spawnT: 0, interT: 0,
+
+    reset() { this.wave = 0; this.queue.length = 0; this.interT = 0.8; },
+
+    poolFor(w) {
+      const pool = ['seeker'];
+      for (let i = 1; i < UNLOCKS.length && i <= w; i++) pool.push(...UNLOCKS[i]);
+      return pool;
+    },
+
+    beginWave(g) {
+      this.wave++;
+      g.wave = this.wave;
+      g.banner = { text: 'WAVE ' + this.wave, t: 0, dur: 2.0 };
+      NV.Audio.setIntensity(this.wave, 'playing');
+      NV.Audio.waveIn();
+
+      let budget = 6 + this.wave * 2.6;
+      const pool = this.poolFor(this.wave);
+      const q = this.queue;
+      q.length = 0;
+      let guard = 300;
+      while (budget > 0.9 && guard-- > 0) {
+        const t = U.pick(pool);
+        const cost = NV.Entities.DEFS[t].cost;
+        if (cost > budget + 0.5) continue;
+        budget -= cost;
+        q.push(t);
+      }
+      q.sort(() => Math.random() - 0.5);
+      this.spawnT = 0.3;
+    },
+
+    update(dt, g) {
+      if (this.interT > 0) {
+        this.interT -= dt;
+        if (this.interT <= 0) this.beginWave(g);
+        return;
+      }
+
+      if (this.queue.length > 0) {
+        this.spawnT -= dt;
+        if (this.spawnT <= 0) {
+          const n = Math.min(this.queue.length, 1 + ((Math.random() * (1 + this.wave * 0.35)) | 0));
+          const pos = this.spawnPos(g);
+          const W = NV.CONFIG.WORLD_W, H = NV.CONFIG.WORLD_H;
+          for (let i = 0; i < n; i++) {
+            const t = this.queue.pop();
+            g.enemies.push(new NV.Entities.Enemy(t,
+              U.clamp(pos.x + U.rand(-30, 30), 30, W - 30),
+              U.clamp(pos.y + U.rand(-30, 30), 30, H - 30)));
+          }
+          this.spawnT = U.rand(0.5, 1.15) * U.clamp(1.2 - this.wave * 0.04, 0.5, 1.2);
+        }
+      } else if (g.enemies.length === 0 && g.state === 'playing' && g.player && !g.player.dead) {
+        /* Wave cleared. */
+        const bonus = 100 * this.wave;
+        g.score += bonus;
+        g.banner = { text: 'WAVE ' + this.wave + ' CLEAR', t: 0, dur: 1.6, sub: '+' + bonus };
+        NV.Audio.waveIn();
+        this.interT = 2.0;
+      }
+    },
+
+    /* 72% edge spawns, 28% interior — never closer than 300px to the player. */
+    spawnPos(g) {
+      const W = NV.CONFIG.WORLD_W, H = NV.CONFIG.WORLD_H, p = g.player;
+      if (Math.random() < 0.72) {
+        const side = (Math.random() * 4) | 0;
+        if (side === 0) return { x: U.rand(40, W - 40), y: 42 };
+        if (side === 1) return { x: W - 42, y: U.rand(40, H - 40) };
+        if (side === 2) return { x: U.rand(40, W - 40), y: H - 42 };
+        return { x: 42, y: U.rand(40, H - 40) };
+      }
+      for (let i = 0; i < 20; i++) {
+        const x = U.rand(80, W - 80), y = U.rand(80, H - 80);
+        if (U.dist2(x, y, p.x, p.y) > 300 * 300) return { x, y };
+      }
+      return { x: 60, y: 60 };
+    },
+  };
+
+  window.NV.Waves = Waves;
+})();
+
+</script>
+<script>
+/* ==== inlined: js/game.js ==== */
+'use strict';
+/* ============================================================
+   NEON VOID — game.js
+   Orchestrator: state machine, fixed-substep main loop, all
+   collision passes (spatial-hash culled), camera trauma shake,
+   hit-stop / slow-motion, bombs, HUD, menus, game over stats.
+   ============================================================ */
+(function () {
+  const U = NV.U, Render = NV.Render, Input = NV.Input, Grid = NV.Grid,
+        Fx = NV.Fx, A = NV.Audio, Waves = NV.Waves;
+  const { Enemy, Pickup, Player } = NV.Entities;
+  const P = NV.PALETTE, CW = NV.CONFIG.WORLD_W, CH = NV.CONFIG.WORLD_H;
+
+  const g = {
+    state: 'boot', time: 0,
+    player: null,
+    enemies: [], bullets: [], ebullets: [], pickups: [], shocks: [], stars: [],
+    hash: new U.SpatialHash(72), _q: [], _shockId: 0,
+    score: 0, displayScore: 0, mult: 1, multPulse: 0, bombs: 2, wave: 1,
+    shots: 0, hits: 0, kills: 0, playT: 0,
+    hiScore: 0, newBest: false,
+    freeze: 0, timeScale: 1, _tsTarget: 1, _slowT: 0,
+    flash: 0, flashColor: '#ffffff',
+    cam: { trauma: 0, x: 0, y: 0 },
+    banner: null, overT: 0, menuT: 0, ambientT: 0,
+
+    /* -------------------------------------------------- boot ---- */
+    boot() {
+      const canvas = document.getElementById('game');
+      Render.init(canvas);
+      Input.init(canvas);
+      A.loadMute();
+      Grid.init();
+      this.makeStars();
+      try { this.hiScore = +localStorage.getItem('nv_hiscore') || 0; } catch (e) {}
+
+      const unlock = () => A.init();               // browsers need a gesture
+      window.addEventListener('pointerdown', unlock);
+      window.addEventListener('keydown', unlock);
+      window.addEventListener('blur', () => { if (this.state === 'playing') this.setState('paused'); });
+
+      this.setState('menu');
+      let last = performance.now();
+      const frame = (now) => {
+        requestAnimationFrame(frame);
+        const rdt = Math.min((now - last) / 1000, 0.05);
+        last = now;
+        this.tick(rdt);
+      };
+      requestAnimationFrame(frame);
+    },
+
+    makeStars() {
+      this.stars = [];
+      for (let i = 0; i < 110; i++)
+        this.stars.push({ x: Math.random() * CW, y: Math.random() * CH, z: 0.25 + Math.random() * 0.75, tw: Math.random() * 10 });
+    },
+
+    setState(s) {
+      this.state = s;
+      if (s === 'menu') { this.menuT = 0; this.seedMenu(); }
+      if (s === 'playing') A.setIntensity(this.wave, 'playing');
+    },
+
+    seedMenu() {
+      this.enemies.length = 0; this.bullets.length = 0; this.ebullets.length = 0;
+      this.pickups.length = 0; this.shocks.length = 0;
+      for (let i = 0; i < 7; i++) {
+        const e = new Enemy(U.pick(['drifter', 'seeker']),
+          U.rand(100, CW - 100), U.rand(100, CH - 100), { instant: true });
+        e.state = 'menu';
+        e.vx = U.rand(-40, 40); e.vy = U.rand(-40, 40);
+        this.enemies.push(e);
+      }
+      A.setIntensity(0, 'menu');
+    },
+
+    startGame() {
+      this.enemies.length = 0; this.bullets.length = 0; this.ebullets.length = 0;
+      this.pickups.length = 0; this.shocks.length = 0;
+      Fx.reset();
+      this.player = new Player();
+      this.score = 0; this.displayScore = 0; this.mult = 1; this.multPulse = 0;
+      this.bombs = NV.TUNE.player.startBombs;
+      this.shots = 0; this.hits = 0; this.kills = 0; this.playT = 0;
+      this.newBest = false; this.freeze = 0; this.flash = 0;
+      this.timeScale = 1; this._tsTarget = 1; this._slowT = 0;
+      this.banner = null; this.overT = 0;
+      Waves.reset();
+      this.setState('playing');
+    },
+
+    gameOver() {
+      this.overT = 0;
+      this.setState('gameover');
+      if (this.score > this.hiScore) {
+        this.hiScore = this.score; this.newBest = true;
+        try { localStorage.setItem('nv_hiscore', String(this.score)); } catch (e) {}
+      }
+    },
+
+    addTrauma(t) { this.cam.trauma = Math.min(1, this.cam.trauma + t); },
+    slowmo(scale, dur) { this._tsTarget = scale; this._slowT = dur; },
+
+    /* -------------------------------------------------- tick ---- */
+    tick(rdt) {
+      Input.update();
+
+      if (Input.consume('KeyM')) { A.init(); A.toggleMute(); }
+      if (this.state === 'menu' &&
+          (Input.consume('Enter') || Input.consume('Space') ||
+           (Input.mouse.down && this.menuT > 0.4))) {
+        A.init(); this.startGame();
+      } else if (this.state === 'playing' && (Input.consume('KeyP') || Input.consume('Escape'))) {
+        this.setState('paused');
+      } else if (this.state === 'paused' &&
+                 (Input.consume('KeyP') || Input.consume('Escape') || Input.consume('Enter'))) {
+        this.setState('playing');
+      } else if (this.state === 'gameover' && this.overT > 1 &&
+                 (Input.consume('Enter') || Input.consume('Space') || Input.consume('KeyR') || Input.mouse.down)) {
+        this.startGame();
+      }
+
+      if (this.freeze > 0) {
+        this.freeze -= rdt;                    // hit-stop: world holds its breath
+      } else {
+        if (this._slowT > 0) { this._slowT -= rdt; if (this._slowT <= 0) this._tsTarget = 1; }
+        this.timeScale = U.lerp(this.timeScale, this._tsTarget, Math.min(1, rdt * 8));
+        this.time += rdt;
+        this.update(rdt * this.timeScale, rdt);
+      }
+      Input.endFrame();
+      this.render();
+    },
+
+    update(dt, rdt) {
+      /* Camera: trauma-based shake (quadratic falloff, noise-modulated). */
+      this.cam.trauma = Math.max(0, this.cam.trauma - rdt * 1.5);
+      const sh = this.cam.trauma * this.cam.trauma;
+      this.cam.x = sh * 26 * Math.sin(this.time * 217) * Math.sin(this.time * 139);
+      this.cam.y = sh * 22 * Math.sin(this.time * 193) * Math.sin(this.time * 167);
+      this.flash = Math.max(0, this.flash - rdt * 2.2);
+      this.displayScore += (this.score - this.displayScore) * Math.min(1, rdt * 10);
+      this.multPulse = Math.max(0, this.multPulse - rdt * 3);
+
+      if (this.state === 'playing') this.updatePlaying(dt);
+      else if (this.state === 'menu') this.updateMenu(dt);
+      else if (this.state === 'gameover') { this.overT += rdt; Fx.update(dt); Grid.update(dt); }
+      /* paused: nothing simulates */
+    },
+
+    updateMenu(dt) {
+      this.menuT += dt;
+      for (const e of this.enemies) e.update(dt, this);
+      U.compact(this.enemies);
+      Fx.update(dt); Grid.update(dt);
+      this.ambientT -= dt;
+      if (this.ambientT <= 0) {
+        this.ambientT = U.rand(0.8, 2.2);
+        Grid.pulse(U.rand(200, CW - 200), U.rand(150, CH - 150), 220, U.rand(60, 160));
+      }
+      for (const s of this.stars) {
+        s.x += 6 * s.z * dt; s.y += 3 * s.z * dt; s.tw += dt;
+        if (s.x > CW) s.x -= CW;
+        if (s.y > CH) s.y -= CH;
+      }
+    },
+
+    /* ------------------------------------------------- world ---- */
+    updatePlaying(dt) {
+      const p = this.player;
+      this.playT += dt;
+      Waves.update(dt, this);
+      if (this.banner) { this.banner.t += dt; if (this.banner.t > this.banner.dur) this.banner = null; }
+
+      /* 1. Broad-phase hash (active enemies only). */
+      this.hash.clear();
+      for (const e of this.enemies) if (e.state === 'active' && !e.dead) this.hash.insert(e);
+
+      /* 2. Player. */
+      p.update(dt, this);
+
+      /* 3. Enemies: behavior, movement, mutual separation. */
+      for (const e of this.enemies) {
+        if (e.dead) continue;
+        e.update(dt, this);
+        if (e.state === 'active' && !e.dead) {
+          const near = this.hash.query(e.x, e.y, e.r + 46, this._q);
+          for (const o of near) {
+            if (o === e || o.dead) continue;
+            const dx = o.x - e.x, dy = o.y - e.y;
+            const rr = o.r + e.r, d2 = dx * dx + dy * dy;
+            if (d2 < rr * rr && d2 > 0.001) {
+              const d = Math.sqrt(d2), nx = dx / d, ny = dy / d, push = (rr - d) * 0.5;
+              e.x -= nx * push; e.y -= ny * push;
+              o.x += nx * push; o.y += ny * push;
+            }
+          }
+        }
+      }
+
+      /* 4. Enemy-player contact (only while the player is vulnerable). */
+      if (!p.dead && p.invuln <= 0) {
+        for (const e of this.enemies) {
+          if (e.dead || e.state !== 'active') continue;
+          if (U.dist2(e.x, e.y, p.x, p.y) < (e.r + p.r) * (e.r + p.r)) {
+            e.die(false, this);
+            p.takeHit(this);
+          }
+        }
+      }
+
+      /* 5. Gravity wells pull player, bullets, pickups. */
+      for (const e of this.enemies) {
+        if (e.dead || e.type !== 'well' || e.state !== 'active') continue;
+        const R = 520;
+        const pull = (o, mul) => {
+          const dx = e.x - o.x, dy = e.y - o.y, d2 = dx * dx + dy * dy;
+          if (d2 > R * R || d2 < 100) return;
+          const d = Math.sqrt(d2);
+          const a = Math.min(760, 5200000 / d2) * mul;
+          o.vx += (dx / d) * a * dt;
+          o.vy += (dy / d) * a * dt;
+        };
+        if (!p.dead) pull(p, 1);
+        for (const b of this.bullets) if (!b.dead) pull(b, 0.55);
+        for (const pk of this.pickups) if (!pk.dead) pull(pk, 0.3);
+      }
+
+      /* 6. Player bullets: swept collision vs enemies and enemy bullets. */
+      for (const b of this.bullets) {
+        if (b.dead) continue;
+        b.px = b.x; b.py = b.y;
+        b.x += b.vx * dt; b.y += b.vy * dt;
+        b.life -= dt;
+        if (b.life <= 0 || b.x < -20 || b.x > CW + 20 || b.y < -20 || b.y > CH + 20) {
+          b.dead = true;
+          continue;
+        }
+        const near = this.hash.query(b.x, b.y, 90, this._q);
+        for (const e of near) {
+          if (e.dead || e.state !== 'active') continue;
+          const rr = e.r + b.r;
+          if (U.segCircle(b.px, b.py, b.x, b.y, e.x, e.y, rr)) {
+            b.dead = true; this.hits++;
+            const l = Math.hypot(b.vx, b.vy) || 1;
+            e.hurt(1, b.vx / l, b.vy / l, this);
+            break;
+          }
+        }
+        if (!b.dead) {
+          for (const eb of this.ebullets) {
+            if (eb.dead) continue;
+            if (U.dist2(b.x, b.y, eb.x, eb.y) < 74) {      // (3.6+5)^2
+              b.dead = true; eb.dead = true; this.hits++;
+              this.score += 10 * this.mult;
+              Fx.burst(eb.x, eb.y, P.ebullet, 6, 200, { life: 0.3 });
+              A.enemyHit();
+              break;
+            }
+          }
+        }
+      }
+
+      /* 7. Enemy bullets. */
+      for (const b of this.ebullets) {
+        if (b.dead) continue;
+        b.px = b.x; b.py = b.y;
+        b.x += b.vx * dt; b.y += b.vy * dt;
+        b.life -= dt;
+        if (b.life <= 0 || b.x < 6 || b.x > CW - 6 || b.y < 6 || b.y > CH - 6) {
+          b.dead = true;
+          Fx.dot(b.x, b.y, P.ebullet, { sp: 60, life: 0.2, size: 2 });
+          continue;
+        }
+        if (!p.dead && p.invuln <= 0 &&
+            U.dist2(b.x, b.y, p.x, p.y) < (b.r + p.r) * (b.r + p.r)) {
+          b.dead = true;
+          p.takeHit(this);
+        }
+      }
+
+      /* 8. Shockwaves (bombs). */
+      for (const s of this.shocks) {
+        if (s.dead) continue;
+        s.r += s.speed * dt;
+        s.life -= dt;
+        if (s.life <= 0) { s.dead = true; continue; }
+        for (const e of this.enemies) {
+          if (e.dead || e.state !== 'active' || e.hitBy === s.id) continue;
+          if (U.dist2(e.x, e.y, s.x, s.y) < (s.r + e.r) * (s.r + e.r)) {
+            e.hitBy = s.id;
+            const d = Math.max(1, Math.hypot(e.x - s.x, e.y - s.y));
+            e.hurt(3, (e.x - s.x) / d, (e.y - s.y) / d, this);
+          }
+        }
+        if (s.killBullets) {
+          for (const b of this.ebullets) {
+            if (!b.dead && U.dist2(b.x, b.y, s.x, s.y) < (s.r + 6) * (s.r + 6)) {
+              b.dead = true;
+              Fx.burst(b.x, b.y, P.ebullet, 4, 140, { life: 0.25 });
+            }
+          }
+        }
+      }
+
+      /* 9. Pickups. */
+      for (const k of this.pickups) if (!k.dead) k.update(dt, this);
+
+      /* 10. Bomb trigger. */
+      const wantBomb = Input.consume('KeyQ') || Input.consume('Space') ||
+        Input.mouse.mEdge || Input.padEdge[2] || Input.padEdge[4];
+      if (wantBomb && this.bombs > 0) this.useBomb();
+
+      /* 11. FX, grid, parallax stars. */
+      Fx.update(dt);
+      Grid.update(dt);
+      for (const s of this.stars) {
+        s.x -= p.vx * 0.018 * s.z * dt; s.y -= p.vy * 0.018 * s.z * dt; s.tw += dt;
+        if (s.x < 0) s.x += CW; if (s.x > CW) s.x -= CW;
+        if (s.y < 0) s.y += CH; if (s.y > CH) s.y -= CH;
+      }
+
+      U.compact(this.enemies); U.compact(this.bullets); U.compact(this.ebullets);
+      U.compact(this.pickups); U.compact(this.shocks);
+    },
+
+    spawnEBullet(x, y, a, sp) {
+      this.ebullets.push({
+        x, y, px: x, py: y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: 6, r: 5, dead: false,
+      });
+    },
+
+    spawnPickup(kind, x, y) { this.pickups.push(new Pickup(kind, x, y)); },
+
+    dropLoot(e) {
+      const roll = Math.random();
+      if (roll < 0.012) this.spawnPickup('life', e.x, e.y);
+      else if (roll < 0.042) this.spawnPickup('bomb', e.x, e.y);
+      else if (roll < 0.105) this.spawnPickup(U.pick(['triple', 'rapid', 'shield']), e.x, e.y);
+      else if (roll < 0.25) this.spawnPickup('gem', e.x, e.y);
+    },
+
+    useBomb() {
+      this.bombs--;
+      const p = this.player;
+      A.bomb();
+      this.flash = 1; this.flashColor = '#cfe8ff';
+      this.addTrauma(0.8);
+      this.slowmo(0.45, 0.35);
+      p.invuln = Math.max(p.invuln, 0.8);
+      Grid.pulse(p.x, p.y, 900, 900);
+      Grid.pulse(p.x, p.y, 500, -300);
+      Fx.ring(p.x, p.y, '#ffffff', 10, 1500, 0.8, 4);
+      Fx.ring(p.x, p.y, P.player, 10, 1100, 1.0, 3);
+      Fx.burst(p.x, p.y, '#ffffff', 60, 700, { life: 0.7 });
+      this.shocks.push({
+        x: p.x, y: p.y, r: 20, speed: 1500, life: 0.55,
+        killBullets: true, id: ++this._shockId, dead: false,
+      });
+    },
+
+    /* ------------------------------------------------ rendering -- */
+    render() {
+      Render.begin();
+      const c = Render.ctx;
+      Render.world(this.cam.x, this.cam.y);
+
+      /* Parallax starfield. */
+      c.globalCompositeOperation = 'lighter';
+      for (const s of this.stars) {
+        c.globalAlpha = 0.25 + 0.55 * s.z * (0.6 + 0.4 * Math.sin(s.tw * 3 + s.x));
+        c.fillStyle = '#9fb4ff';
+        c.fillRect(s.x, s.y, s.z * 2.2, s.z * 2.2);
+      }
+      c.globalAlpha = 1;
+
+      /* Warping lattice. */
+      Grid.draw(c);
+
+      /* Entities (all additive). */
+      c.globalCompositeOperation = 'lighter';
+      for (const k of this.pickups) if (!k.dead) k.draw(c);
+      for (const e of this.enemies) if (!e.dead) e.draw(c, this);
+
+      for (const b of this.ebullets) {
+        if (b.dead) continue;
+        Render.drawGlow(b.x, b.y, 12, P.ebullet, 0.8);
+        c.fillStyle = '#ffd0c0';
+        c.beginPath(); c.arc(b.x, b.y, b.r - 1.6, 0, U.TAU); c.fill();
+        c.globalAlpha = 0.35; c.fillStyle = P.ebullet;
+        c.beginPath(); c.arc(b.x, b.y, b.r + 1.5, 0, U.TAU); c.fill();
+        c.globalAlpha = 1;
+      }
+
+      for (const b of this.bullets) {
+        if (b.dead) continue;
+        Render.drawGlow(b.x, b.y, 10, P.player, 0.7);
+        c.lineCap = 'round';
+        c.strokeStyle = P.bullet; c.lineWidth = 3.4; c.globalAlpha = 0.9;
+        c.beginPath();
+        c.moveTo(b.x - b.vx * 0.012, b.y - b.vy * 0.012);
+        c.lineTo(b.x, b.y); c.stroke();
+        c.strokeStyle = '#ffffff'; c.lineWidth = 1.4; c.globalAlpha = 1;
+        c.beginPath();
+        c.moveTo(b.x - b.vx * 0.008, b.y - b.vy * 0.008);
+        c.lineTo(b.x, b.y); c.stroke();
+      }
+
+      for (const s of this.shocks)
+        if (!s.dead) Render.neonCircle(s.x, s.y, s.r, '#ffffff', 2.5, U.clamp(s.life * 2, 0, 1) * 0.8);
+
+      if (this.player && this.state !== 'menu') this.player.draw(c, this);
+
+      Fx.draw(c);
+
+      /* Arena border + world-space UI. */
+      c.globalCompositeOperation = 'source-over';
+      this.drawBorder(c);
+      if (this.state === 'playing' || this.state === 'paused') this.drawHUD(c);
+
+      /* State overlays. */
+      if (this.state === 'menu') this.drawMenu(c);
+      if (this.state === 'paused') this.drawPaused(c);
+      if (this.state === 'gameover') this.drawGameOver(c);
+
+      /* Damage / bomb flash. */
+      if (this.flash > 0) {
+        c.globalAlpha = Math.min(0.85, this.flash);
+        c.fillStyle = this.flashColor;
+        c.fillRect(-200, -200, CW + 400, CH + 400);
+        c.globalAlpha = 1;
+      }
+
+      Render.post();
+    },
+
+    drawBorder(c) {
+      const m = 10, L = 26;
+      Render.neon([[m, m], [CW - m, m], [CW - m, CH - m], [m, CH - m]], P.border, 2, 0.8, true);
+      Render.neon([[m, m + L], [m, m], [m + L, m]], '#5f8fff', 2.5, 0.9, false);
+      Render.neon([[CW - m - L, m], [CW - m, m], [CW - m, m + L]], '#5f8fff', 2.5, 0.9, false);
+      Render.neon([[CW - m, CH - m - L], [CW - m, CH - m], [CW - m - L, CH - m]], '#5f8fff', 2.5, 0.9, false);
+      Render.neon([[m + L, CH - m], [m, CH - m], [m, CH - m - L]], '#5f8fff', 2.5, 0.9, false);
+    },
+
+    /* --------------------------------------------------- HUD ---- */
+    drawHUD(c) {
+      const p = this.player;
+      c.textBaseline = 'alphabetic';
+
+      /* Score, top-left. */
+      c.textAlign = 'left';
+      c.font = '700 13px system-ui, sans-serif';
+      c.fillStyle = P.dim;
+      c.fillText('SCORE', 28, 40);
+      c.font = '900 34px system-ui, sans-serif';
+      c.fillStyle = '#ffffff';
+      c.shadowColor = P.player; c.shadowBlur = 14;
+      c.fillText(String(Math.round(this.displayScore)).padStart(7, '0'), 28, 72);
+      c.shadowBlur = 0;
+      c.font = '700 13px system-ui, sans-serif';
+      c.fillStyle = P.dim;
+      c.fillText('HI ' + String(Math.max(this.hiScore, this.score)).padStart(7, '0'), 28, 94);
+      c.fillText('WAVE ' + this.wave, 28, 114);
+
+      /* Multiplier, top-right. */
+      c.textAlign = 'right';
+      c.font = '700 12px system-ui, sans-serif';
+      c.fillStyle = P.dim;
+      c.fillText('MULTIPLIER', CW - 28, 40);
+      c.font = `900 ${30 + this.multPulse * 26}px system-ui, sans-serif`;
+      c.fillStyle = this.mult > 1 ? P.mult : P.dim;
+      if (this.mult > 1) { c.shadowColor = P.mult; c.shadowBlur = 16; }
+      c.fillText('x' + this.mult, CW - 28, 72);
+      c.shadowBlur = 0;
+
+      /* Lives, bottom-left. */
+      for (let i = 0; i < p.lives; i++)
+        Render.neonPoly(42 + i * 30, CH - 40, 9, 3, -Math.PI / 2, P.player, 1.6, 0.9);
+
+      /* Bombs + dash bar, bottom-right. */
+      c.textAlign = 'right';
+      c.font = '700 12px system-ui, sans-serif';
+      c.fillStyle = P.dim;
+      c.fillText('BOMBS [SPACE]', CW - 28, CH - 58);
+      for (let i = 0; i < this.bombs; i++)
+        Render.neonPoly(CW - 40 - i * 26, CH - 36, 8, 4, 0, '#ffb020', 1.8, 1);
+      const dr = 1 - U.clamp(p.dashCd / NV.TUNE.player.dashCd, 0, 1);
+      c.fillStyle = 'rgba(120,150,220,0.25)';
+      c.fillRect(CW - 148, CH - 22, 120, 4);
+      c.fillStyle = dr >= 1 ? P.player : 'rgba(69,240,255,0.45)';
+      c.fillRect(CW - 148, CH - 22, 120 * dr, 4);
+      c.font = '700 11px system-ui, sans-serif';
+      c.fillStyle = P.dim;
+      c.fillText('DASH [SHIFT]', CW - 156, CH - 18);
+
+      /* Active powerup timers, bottom-center. */
+      let py = CH - 24;
+      const bar = (label, t, colr) => {
+        const w = 150;
+        c.textAlign = 'left';
+        c.font = '700 11px system-ui, sans-serif';
+        c.fillStyle = colr;
+        c.fillText(label, CW / 2 - w / 2, py - 6);
+        c.fillStyle = 'rgba(255,255,255,0.15)';
+        c.fillRect(CW / 2 - w / 2, py, w, 3);
+        c.fillStyle = colr;
+        c.fillRect(CW / 2 - w / 2, py, w * (t / NV.TUNE.powerupTime), 3);
+        py -= 26;
+      };
+      if (p.powerTriple > 0) bar('TRIPLE SHOT', p.powerTriple, '#ffd23c');
+      if (p.powerRapid > 0) bar('RAPID FIRE', p.powerRapid, '#ff5cf0');
+
+      /* Sound hint. */
+      c.textAlign = 'center';
+      c.font = '700 11px system-ui, sans-serif';
+      c.fillStyle = 'rgba(125,143,201,0.55)';
+      c.fillText('[M] SOUND ' + (A.muted ? 'OFF' : 'ON'), CW / 2, CH - 18);
+
+      /* Wave banner. */
+      if (this.banner) {
+        const b = this.banner;
+        const inK = U.clamp(b.t / 0.25, 0, 1);
+        const outK = U.clamp((b.dur - b.t) / 0.4, 0, 1);
+        const a = Math.min(inK, outK);
+        const y = CH * 0.30;
+        Render.spaced(b.text, CW / 2, y, 54, 14, `rgba(255,255,255,${a})`);
+        if (b.sub) Render.spaced(b.sub, CW / 2, y + 44, 20, 8, `rgba(255,210,60,${a})`);
+      }
+    },
+
+    /* ------------------------------------------------- menus ---- */
+    drawMenu(c) {
+      c.fillStyle = 'rgba(3,5,14,0.55)';
+      c.fillRect(0, 0, CW, CH);
+      const t = this.menuT;
+      const a = Math.min(1, t / 0.8);
+      const ty = CH * 0.26 + Math.sin(t * 1.4) * 6;
+
+      c.shadowColor = P.player; c.shadowBlur = 38;
+      Render.spaced('NEON VOID', CW / 2, ty, 88, 24, `rgba(69,240,255,${0.85 * a})`);
+      c.shadowBlur = 0;
+      Render.spaced('NEON VOID', CW / 2, ty, 88, 24, `rgba(255,255,255,${a})`);
+      Render.spaced('A TWIN-STICK ARCADE SHOOTER', CW / 2, ty + 58, 17, 9, `rgba(125,143,201,${a})`, 'center', 700);
+
+      if (this.hiScore > 0)
+        Render.spaced('BEST ' + String(this.hiScore).padStart(7, '0'), CW / 2, ty + 96, 20, 8, `rgba(255,210,60,${a})`);
+
+      /* Blinking prompt. */
+      const pa = (0.55 + 0.45 * Math.sin(t * 4)) * Math.min(1, t / 0.5);
+      Render.spaced('CLICK OR PRESS ENTER TO START', CW / 2, CH * 0.56, 24, 10, `rgba(223,232,255,${pa})`);
+
+      /* Controls table. */
+      const rows = [
+        ['MOVE', 'W A S D  /  ARROWS  /  LEFT STICK'],
+        ['AIM + FIRE', 'MOUSE  /  RIGHT STICK'],
+        ['DASH', 'SHIFT  /  RIGHT CLICK  /  RB'],
+        ['BOMB', 'SPACE  /  Q  /  X'],
+        ['PAUSE · MUTE', 'P OR ESC  ·  M'],
+      ];
+      c.font = '600 15px system-ui, sans-serif';
+      c.textBaseline = 'middle';
+      let y = CH * 0.70;
+      for (const r of rows) {
+        c.textAlign = 'right';
+        c.fillStyle = P.dim;
+        c.fillText(r[0], CW / 2 - 20, y);
+        c.textAlign = 'left';
+        c.fillStyle = P.text;
+        c.fillText(r[1], CW / 2 + 20, y);
+        y += 27;
+      }
+      c.textBaseline = 'alphabetic';
+
+      Render.spaced('VANILLA JS · NO ASSETS · NO LIBRARIES', CW / 2, CH - 34, 12, 6, 'rgba(125,143,201,0.6)', 'center', 700);
+    },
+
+    drawPaused(c) {
+      c.fillStyle = 'rgba(3,5,14,0.66)';
+      c.fillRect(0, 0, CW, CH);
+      Render.spaced('PAUSED', CW / 2, CH * 0.42, 54, 16, '#ffffff');
+      Render.spaced('P / ESC TO RESUME', CW / 2, CH * 0.52, 16, 8, P.dim, 'center', 700);
+    },
+
+    drawGameOver(c) {
+      const a = U.clamp((this.overT - 0.3) / 0.5, 0, 1);
+      if (a <= 0) return;
+      c.fillStyle = `rgba(3,5,14,${0.78 * a})`;
+      c.fillRect(0, 0, CW, CH);
+      c.globalAlpha = a;
+
+      Render.spaced('GAME OVER', CW / 2, CH * 0.24, 64, 18, '#ff5a5a');
+
+      if (this.newBest) {
+        const b = 0.6 + 0.4 * Math.sin(this.time * 6);
+        Render.spaced('NEW BEST!', CW / 2, CH * 0.33, 24, 10, `rgba(255,210,60,${b})`);
+      }
+
+      c.font = '900 44px system-ui, sans-serif';
+      c.textAlign = 'center'; c.textBaseline = 'alphabetic';
+      c.fillStyle = '#ffffff';
+      c.shadowColor = P.player; c.shadowBlur = 18;
+      c.fillText(String(this.score).padStart(7, '0'), CW / 2, CH * 0.47);
+      c.shadowBlur = 0;
+
+      const acc = this.shots ? Math.round(100 * this.hits / this.shots) : 0;
+      const mm = (this.playT / 60) | 0, ss = String((this.playT % 60) | 0).padStart(2, '0');
+      const rows = [
+        ['WAVE REACHED', String(this.wave)],
+        ['ENEMIES DESTROYED', String(this.kills)],
+        ['ACCURACY', acc + '%'],
+        ['TIME SURVIVED', mm + ':' + ss],
+        ['BEST', String(this.hiScore).padStart(7, '0')],
+      ];
+      c.font = '600 17px system-ui, sans-serif';
+      let y = CH * 0.55;
+      for (const r of rows) {
+        c.textAlign = 'left'; c.fillStyle = P.dim;
+        c.fillText(r[0], CW / 2 - 230, y);
+        c.textAlign = 'right'; c.fillStyle = P.text;
+        c.fillText(r[1], CW / 2 + 230, y);
+        y += 32;
+      }
+
+      const pa = 0.55 + 0.45 * Math.sin(this.time * 4);
+      Render.spaced('ENTER / CLICK TO RETRY', CW / 2, CH * 0.88, 20, 9, `rgba(223,232,255,${pa})`);
+      c.globalAlpha = 1;
+    },
+  };
+
+  window.NV = window.NV || {};
+  window.NV.game = g;
+  g.boot();
+})();
+
+</script>
+</body>
+</html>
